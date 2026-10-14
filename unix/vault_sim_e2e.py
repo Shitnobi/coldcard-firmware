@@ -138,7 +138,10 @@ if exp.get('ccc_vel'):
         print('      ccc unavailable: %s' % e)
 
 # --- cleanup ---------------------------------------------------------------
-vault.wipe()
+# PR C: wipe() now returns (ok, msg) and never raises - check it, a
+# silently-surviving policy would poison the next e2e run
+res, msg = vault.wipe()
+ok('cleanup wipe ok', res)
 s.save()
 
 n = sum(1 for _, c in R if c)

@@ -189,3 +189,48 @@ real PSBT tx bytes: `8317744dbdd8cb62975ede46c71874681de147bcc95a6c6e3e`
 - Test reality: hostapp 54/54; e2e 16/16 (regression, generator path);
   smoke 14/14; glue 34/34; policy 8/8. All in one run after the
   sys.path fix.
+
+## Session 2026-10-14 (e) — external review: 12 issues, 3 fix PRs merged
+
+- **External review (Rob1Ham)** filed 12 issues against
+  `vault-cosign-policy` @ ef162dfa plus three fix PRs from their fork
+  (PR #13 fix/vault-hostapp e4b64c62 -> issues #1-4; PR #14
+  fix/vault-policy cb80710d -> #5-9; PR #15 fix/vault-menu 8759e21d ->
+  #10-11; #12 = review notes/open design questions). All 11 bug claims
+  verified against the code locally (line-level) before any merge.
+  Under the recovery-key invariant (2-of-3 S_v, unencumbered third key
+  on the second device: the multisig branch sits outside the CSV/IF
+  branch, so principal is ALWAYS recoverable), no issue can strand
+  coins; residual severity concentrates in policy-enforcement and
+  trust-display gaps (#8 is_change, #11d lattice pre-load, #4 silent
+  root divergence).
+- **Fixes merged after audit**: every diff read line-by-line; each
+  PR's suites run individually (hostapp 110/110, glue 55/55 + policy
+  9/9 for B, glue 46/46 for C - all reviewer claims reproduced
+  exactly); 3-way merge built with one trivial textual conflict (PRs B
+  and C both append test sections at the same anchor in
+  testing/test_vault.py - resolved by keeping both). Notable fix
+  accuracy: PR B's is_change fix correctly identified that
+  _check_emergency L217 already refused change outputs and only the
+  view was dropping the flag (consider_outputs runs before the vault
+  gate in auth.py:418 < 447 - verified).
+- **New issues from the fixes: none found.** Audited specifically:
+  VaultPolicy.__init__ now raises VaultViolation - all three
+  construction sites handle it (could_sign catches VaultViolation AND
+  Exception -> fail-closed; validate_cfg wraps; enroll_lattice is
+  pre-validated by the menu). wipe() API now returns (ok, msg) -
+  vault_sim_e2e.py updated to check it (this session). save_cfg now
+  flushes via settings.save() (ccc/sssp precedent); store_lattice
+  calls it bare but the menu wraps it.
+- **Known deviation**: issue #6 text demanded a P2WSH shape check on
+  exit_spk too; PR B checks only the sv_hash/spk_e collision. Defensible
+  (exit_spk is user-overridable to any destination in the hostapp),
+  but the any-spk vs P2WSH-only exit-destination policy is an OPEN
+  design decision (#12). Others open: master-scoping the vault cfg
+  (MASTER_FIELDS vs menu predicate - PR C took the predicate), device
+  cross-check of manifest vault_vout (#12.4), lattice re-enrollment
+  after post-enrollment n/fee edits.
+- **e2e driver**: vault_sim_e2e.py cleanup now asserts wipe() ok (was
+  ignoring the new return value); sim-e2e is 17 checks, app-tree 11.
+- Test reality after merge (one run): hostapp 110/110; glue 67/67;
+  policy 9/9; sim e2e 17/17; app-tree e2e 11/11; smoke 14/14.
