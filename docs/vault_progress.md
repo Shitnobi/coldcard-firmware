@@ -390,3 +390,16 @@ manifest cross-check):**
   Sufficient under the recovery-key invariant (mis-enrollment cannot
   strand funds: 2-of-3 with one unencumbered key), which is exactly
   why the weaker (b) was acceptable to ship now.
+
+### Issue tracker closure (2026-10-14)
+
+- Issue #12 (review notes / open questions) closed with a reply comment
+  (Shitnobi/coldcard-firmware#issuecomment-6175897839) explaining the
+  choices: Q1 master-scoping -> implemented (Decision A, 5e82925e);
+  Q4 device-side manifest cross-check -> implemented (Decision B,
+  a50cfc00); Q2 P2 hard mode -> declined (structural P2 routing +
+  recovery-key invariant; dict field if ever wanted); Q3 strict menu ->
+  intentional omission (dedicated-signer posture; re-enroll to change);
+  Q5 vault.log growth -> accepted platform pattern. All 12 review
+  issues are now closed; the living record for unchosen design paths is
+  this ledger (sessions g/h).
