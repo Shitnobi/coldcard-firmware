@@ -210,6 +210,17 @@ def build_scripts(pol):
 
 
 def cfg_from_policy(pol, s_v, s_e):
+    # exit destinations are confined to P2WSH (VaultPolicy shape check
+    # on-device); refuse a non-P2WSH override here too, with a clearer
+    # message than the device's 'bad policy' enrollment refusal
+    ex = pol.get('exit_spk')
+    if ex:
+        b = bytes.fromhex(ex)
+        if len(b) != 34 or b[:2] != b'\x00\x20':
+            raise SystemExit(
+                'ERROR: exit_spk must be a P2WSH scriptPubKey '
+                '(34 bytes: OP_0 PUSH32 <hash>), got %d-byte spk %s'
+                % (len(b), ex))
     return {
         'n': pol['n'],
         'sv_hash': vp.p2wsh_spk(s_v).hex(),

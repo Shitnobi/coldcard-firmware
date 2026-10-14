@@ -160,6 +160,14 @@ def test_cfg_structural_validation():
     expect_parse(lambda: pol(exit_spk=SPK_EH.hex()))
     expect_parse(lambda: pol(exit_spk=SPK_V.hex()))
 
+    # exit destinations are confined to P2WSH (design decision, issue
+    # #6 resolved): a P2WPKH-style or wrong-length/wrong-prefix
+    # exit_spk must be refused at construction (=> enroll refuses)
+    expect_parse(lambda: pol(exit_spk='0014' + '11' * 20))   # P2WPKH
+    expect_parse(lambda: pol(exit_spk='0011'))               # too short
+    expect_parse(lambda: pol(exit_spk='0020' + '11' * 31))   # 33 bytes
+    expect_parse(lambda: pol(exit_spk='51'))                 # OP_1 bare
+
     # sv_hash/spk_e are P2WSH scriptPubKeys
     expect_parse(lambda: pol(sv_hash='00'))
     expect_parse(lambda: pol(sv_hash='0011'))

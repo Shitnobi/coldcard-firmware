@@ -213,6 +213,34 @@ def test_zero_pad(tmp, spk_v):
         ok('filename sort == leaf order',
            sorted(man['files']) == man['files'])
 
+def test_exit_spk_shape(tmp, spk_v):
+    # exit destinations are confined to P2WSH (device-side VaultPolicy
+    # check): a non-P2WSH exit_spk override must be refused by the app
+    # (better message than the device's enrollment refusal), and a
+    # valid P2WSH override must pass through to the manifest cfg
+    fund = make_funding(tmp, 'input-only', spk_v, 'fund-exit')
+
+    bad = make_policy(tmp, name='policy-badexit.json')
+    d = json.loads(open(bad).read())
+    d['exit_spk'] = '0014' + '11' * 20          # P2WPKH: not P2WSH
+    open(bad, 'w').write(json.dumps(d))
+    r = run_app(bad, fund, os.path.join(tmp, 'tree-badexit'))
+    ok('non-P2WSH exit_spk refused',
+       r.returncode != 0 and 'P2WSH' in (r.stdout + r.stderr))
+
+    good = make_policy(tmp, name='policy-goodexit.json')
+    d = json.loads(open(good).read())
+    d['exit_spk'] = vp.p2wsh_spk(b'\x71' * 32).hex()   # valid P2WSH
+    open(good, 'w').write(json.dumps(d))
+    r = run_app(good, fund, os.path.join(tmp, 'tree-goodexit'))
+    ok('P2WSH exit_spk override accepted', r.returncode == 0)
+    if r.returncode == 0:
+        man = json.loads(open(os.path.join(tmp, 'tree-goodexit',
+                                           'manifest.json')).read())
+        ok('override carried to manifest cfg',
+           man['cfg']['exit_spk'] == vp.p2wsh_spk(b'\x71' * 32).hex())
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix='vault-hostapp-')
     try:
@@ -261,6 +289,7 @@ def main():
 
         test_unknown_key(tmp, policy, spk_v)
         test_zero_pad(tmp, spk_v)
+        test_exit_spk_shape(tmp, spk_v)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -150,6 +150,9 @@ vault.save_cfg(dict(CFG, n=0))
 ok('validate rejects n=0', not vault.validate_cfg(vault._cfg())[0])
 vault.save_cfg(dict(CFG, f0_max=0))
 ok('validate rejects f0_max=0', not vault.validate_cfg(vault._cfg())[0])
+vault.save_cfg(dict(CFG, exit_spk='0014' + '11' * 20))   # P2WPKH
+ok('validate rejects non-P2WSH exit_spk',
+   not vault.validate_cfg(vault._cfg())[0])
 
 vault.save_cfg(dict(CFG))                     # enroll dark
 ok('enrolled dark', not vault.is_enabled())

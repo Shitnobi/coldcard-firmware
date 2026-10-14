@@ -178,7 +178,13 @@ class VaultPolicy:
         # - the cadence N must be a valid height-form CSV value;
         # - f0_max must be a usable positive fee window.
         # Raise here (=> validate_cfg 'bad policy', could_sign refuse).
-        for nm, spk in (('sv_hash', self.spk_v), ('spk_e', self.spk_e)):
+        # DESIGN DECISION (issue #6, resolved): exit destinations are
+        # confined to P2WSH for now - same shape as sv_hash/spk_e. A
+        # non-P2WSH exit_spk is refused at enrollment rather than
+        # silently accepted; revisit if arbitrary destinations are
+        # ever wanted (the check below is the single gate).
+        for nm, spk in (('sv_hash', self.spk_v), ('spk_e', self.spk_e),
+                        ('exit_spk', self.exit_dest)):
             if spk is not None and (len(spk) != 34 or spk[:2] != b'\x00\x20'):
                 raise VaultViolation('%s must be a P2WSH scriptPubKey' % nm)
         if self.k1 is not None and (len(self.k1) != 33 or

@@ -234,3 +234,31 @@ real PSBT tx bytes: `8317744dbdd8cb62975ede46c71874681de147bcc95a6c6e3e`
   ignoring the new return value); sim-e2e is 17 checks, app-tree 11.
 - Test reality after merge (one run): hostapp 110/110; glue 67/67;
   policy 9/9; sim e2e 17/17; app-tree e2e 11/11; smoke 14/14.
+
+## Session 2026-10-14 (f) — submodule artifact resolved; exit_spk confined to P2WSH
+
+- **`external/libngu` "dirty submodule" artifact diagnosed and cleanly
+  ignored**: the dirt is libngu's OWN build applying `bech32.patch`
+  (libngu/Makefile:6, `BECH32_PATCH`) to its nested `libs/bech32`
+  submodule on every build - it un-`static`s `convert_bits()` so
+  `ngu/codecs.c` can link it. Verified byte-for-byte: the working-tree
+  diff in bech32 is exactly the patch. Upstream by-design behavior;
+  reverting would be futile (re-applied at next build). Clean handling:
+  local-only `git config submodule.external/libngu.ignore dirty`
+  (nothing committed, no effect on other clones) -> `git status` fully
+  clean.
+- **DESIGN DECISION (issue #6 tail / #12): exit destinations are
+  confined to P2WSH.** `VaultPolicy.__init__` now shape-checks
+  `exit_spk` (34 bytes, `OP_0 PUSH32`) exactly like `sv_hash`/`spk_e`
+  - a non-P2WSH exit_spk is refused at enrollment (fail-closed).
+  Hostapp mirrors the check with a clearer message
+  (`cfg_from_policy` refuses a non-P2WSH override before building the
+  tree). This closes the PR-B-vs-issue-#6-text deviation: the stricter
+  reading won. Single gate to relax later if arbitrary destinations
+  are ever wanted.
+- Tests added: policy suite - 4 parse-rejections (P2WPKH/short/33-byte/
+  bare-op exit_spk); glue - validate rejects P2WPKH exit_spk; hostapp -
+  non-P2WSH override refused w/ message + valid P2WSH override carried
+  to the manifest cfg.
+- Test reality (one run): policy 9/9; glue 68/68; hostapp 113/113;
+  sim e2e 17/17; app-tree e2e 11/11; smoke 14/14.
