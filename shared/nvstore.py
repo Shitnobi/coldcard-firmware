@@ -98,7 +98,7 @@ KEEP_IF_BLANK_SETTINGS = ["wa", "sighshchk", "emu", "rz", "b39skip",
 
 # key value pairs saved directly to master seed settings
 # held in RAM for tmp seed sessions
-MASTER_FIELDS = ['seeds', 'seedvault', 'xfp', 'words', "bkpw", "sssp", "tsn", 'c32_shares']
+MASTER_FIELDS = ['seeds', 'seedvault', 'xfp', 'words', "bkpw", "sssp", "tsn", 'c32_shares', 'vault']
 
 NUM_SLOTS = const(100)
 SLOTS = range(NUM_SLOTS)

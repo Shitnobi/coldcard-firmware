@@ -77,6 +77,22 @@ vault.save_cfg(dict(cfg))
 res, msg = vault.set_enabled(True)
 ok('vault mode enabled', res and vault.is_enabled())
 
+# --- 1b. master-scoping: the gate stays ON during a tmp-seed session ----
+# 'vault' is in nvstore MASTER_FIELDS; leaving_master_seed() captures it
+# into SettingsObject.master_sv_data and _cfg() reads via master_get.
+# Simulate the session switch with the real nvstore class state: without
+# master-scoping, _cfg() would read the empty tmp scope and the vault
+# gate would silently turn OFF for the whole session.
+nvstore.SettingsObject.master_nvram_key = b'\x22' * 16
+nvstore.SettingsObject.master_sv_data['vault'] = s.current.get('vault')
+ok('gate on during tmp session', vault.is_enabled())
+_leaf = (exp.get('files') or ['emg0.psbt'])[0]
+appr, msg = vault.VaultMode.could_sign(parse(_leaf))
+ok('policy path works during tmp session (canonical leaf approved)', appr)
+nvstore.SettingsObject.master_nvram_key = None
+nvstore.SettingsObject.master_sv_data.clear()
+ok('gate intact after tmp session ends', vault.is_enabled())
+
 # --- 2. lattice enrollment from REAL parsed PSBTs ------------------------
 cnt_want = exp['lattice_count']
 names = exp.get('files') or ['emg%d.psbt' % i for i in range(cnt_want)]

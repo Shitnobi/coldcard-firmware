@@ -262,3 +262,45 @@ real PSBT tx bytes: `8317744dbdd8cb62975ede46c71874681de147bcc95a6c6e3e`
   to the manifest cfg.
 - Test reality (one run): policy 9/9; glue 68/68; hostapp 113/113;
   sim e2e 17/17; app-tree e2e 11/11; smoke 14/14.
+
+## Session 2026-10-14 (g) — DECISION A implemented: vault cfg is master-scoped
+
+- **`'vault'` added to `nvstore.MASTER_FIELDS`**: leaving_master_seed()
+  now captures the vault cfg into SettingsObject.master_sv_data on tmp-
+  seed entry, and `vault._cfg()` reads via `master_get` - the policy
+  gate stays ON for the whole tmp session (before: the plain get read
+  the empty tmp scope and the gate silently turned OFF; benign wrt
+  funds since the tmp seed cannot produce K1 sigs, but a security
+  policy should not have quiet windows).
+- **`save_cfg` uses `master_set`** (ccc/sssp precedent): writes the
+  MASTER seed's store, always flushes immediately, mirrors into
+  master_sv_data during tmp sessions. The vault is now formally a
+  device-level policy: one vault per device (the Coldcard is the
+  dedicated co-signer), surviving seed switches and tmp sessions.
+- **`wipe` is tmp-aware**: during a tmp session it removes the MASTER
+  copy (load master SettingsObject, remove, save, pop the mirror) - a
+  tmp-scope-only removal would leave the policy enforced while
+  claiming it was gone. The menu's is_not_tmp predicate still prevents
+  reaching wipe/enroll from tmp; this makes the API correct anyway.
+- **Menu predicate unchanged** (enrollment stays a master-seed
+  ceremony); the CHANGE is that the gate can no longer be silently
+  absent.
+- Host tests (test_vault.py): fake settings gained master_get/master_set
+  + class-level session state; fake nvstore module registered so
+  wipe()'s `from nvstore import SettingsObject` works on host and the
+  fake SettingsObject IS the fake settings class (faithful to the real
+  device where glob.settings is a SettingsObject instance). New section
+  11: gate visible/enforced during simulated tmp session, tmp-session
+  save goes to master scope, tmp-session wipe removes the master copy,
+  clean return to master.
+- Device tests (vault_sim_e2e.py): section 1b flips the REAL nvstore
+  class state (master_nvram_key + master_sv_data) and checks the gate
+  + full could_sign path during the session. Not vacuous: master_get
+  asserts 'vault' in MASTER_FIELDS, so the check fails unless the
+  nvstore change is live. CAUGHT during this session: an edit
+  accidentally dropped the master_nvram_key setup line, making the
+  first 20/20 run vacuous - restored and re-verified.
+- Test reality (one run): policy 9/9; glue 76/76; hostapp 113/113;
+  sim e2e 20/20; app-tree e2e 14/14; smoke 14/14.
+- Decision B (device-side vault_vout cross-check) deliberately NOT
+  implemented yet per maintainer instruction.

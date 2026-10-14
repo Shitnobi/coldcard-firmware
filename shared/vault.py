@@ -29,9 +29,13 @@ VAULT_LOG = 'vault.log'
 def _cfg():
     # Always returns a dict: a corrupt (non-dict) stored value must not
     # crash menu/signing code with AttributeError halfway through.
+    # Master-scoped read: during a tmp-seed session the plain get would
+    # read the (empty) tmp scope and silently turn the policy gate OFF;
+    # master_get reads the master seed's copy instead ('vault' is in
+    # nvstore MASTER_FIELDS, captured by leaving_master_seed).
     try:
         from glob import settings
-        v = settings.get('vault')
+        v = settings.master_get('vault')
         return v if isinstance(v, dict) else {}
     except Exception:
         return {}
@@ -203,14 +207,15 @@ def validate_cfg(cfg):
 
 def save_cfg(cfg):
     # Persist the vault settings dict under settings key 'vault'.
+    # - master-scoped: the vault is a DEVICE-level policy (the Coldcard
+    #   is the dedicated co-signer) - it must survive seed switches and
+    #   stay enforced during tmp-seed sessions, like ccc/sssp policy
+    #   settings. master_set writes the master seed's store.
     # - immediate save: nvstore.set() (=put) only marks the store dirty
     #   with a 250ms deferred write, so power loss in that window would
-    #   silently lose the change. Enrollment data is security-critical;
-    #   ccc.py/sssp.py write their policy settings via master_set(),
-    #   which always saves immediately. Same guarantee here.
+    #   silently lose the change. master_set always saves immediately.
     from glob import settings
-    settings.set('vault', cfg)
-    settings.save()
+    settings.master_set('vault', cfg)
 
 
 def wipe():
@@ -218,10 +223,22 @@ def wipe():
     # Returns (ok, msg); never raises: a policy that survives a
     # "successful" wipe keeps constraining signing, so the menu must be
     # able to report the failure instead of a silently swallowed one.
+    # Master-scoped: in a tmp-seed session, removing from the current
+    # (tmp) scope would leave the master copy enforced - remove from
+    # the master store itself (the menu's is_not_tmp predicate normally
+    # prevents reaching this in tmp mode, but be correct anyway).
     try:
         from glob import settings
-        settings.remove_key('vault')
-        settings.save()
+        from nvstore import SettingsObject
+        if SettingsObject.master_nvram_key:
+            master = SettingsObject(nvram_key=SettingsObject.master_nvram_key)
+            master.load()
+            master.remove_key('vault')
+            master.save()
+            SettingsObject.master_sv_data.pop('vault', None)
+        else:
+            settings.remove_key('vault')
+            settings.save()
     except Exception as e:
         return False, 'cannot wipe: %s' % (e,)
     return True, 'ok'

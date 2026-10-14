@@ -13,8 +13,17 @@ _store = {'vault': None}
 class _FakeSettings:
     # save() counts flushes; fail_on injects a simulated flash failure
     # (PR C: save_cfg/wipe flush immediately and report failures).
+    # master_nvram_key/master_sv_data emulate the tmp-seed session
+    # machinery from nvstore.SettingsObject (master-scoped reads/writes).
     n_saves = 0
     fail_on = None
+    master_nvram_key = None
+    master_sv_data = {}
+
+    def __init__(self, nvram_key=None):
+        self.nvram_key = nvram_key
+    def load(self):
+        pass        # fake: state already lives in _store
 
     def get(self, k, d=None):
         return _store.get(k, d)
@@ -28,10 +37,33 @@ class _FakeSettings:
         if _FakeSettings.fail_on == 'save':
             raise OSError('sim flash failure')
         _FakeSettings.n_saves += 1
+    def master_get(self, k, d=None):
+        if not _FakeSettings.master_nvram_key:
+            return self.get(k, d)
+        return _FakeSettings.master_sv_data.get(k, d)
+    def master_set(self, k, v):
+        if not _FakeSettings.master_nvram_key:
+            self.set(k, v)
+            self.save()
+        else:
+            # tmp session: write the master store + mirror the copy
+            _store[k] = v
+            _FakeSettings.master_sv_data[k] = v
 
 glob_mod = types.ModuleType('glob')
 glob_mod.settings = _FakeSettings()
 sys.modules['glob'] = glob_mod
+
+# fake nvstore: vault.wipe()'s tmp-session branch imports
+# nvstore.SettingsObject - on the real device glob.settings IS a
+# SettingsObject instance, so the faithful fake reuses _FakeSettings
+# (class attrs master_nvram_key/master_sv_data are shared, exactly like
+# the real class-level session state)
+nvstore_mod = types.ModuleType('nvstore')
+nvstore_mod.SettingsObject = _FakeSettings
+nvstore_mod.MASTER_FIELDS = ['seeds', 'seedvault', 'xfp', 'words', 'bkpw',
+                             'sssp', 'tsn', 'c32_shares', 'vault']
+sys.modules['nvstore'] = nvstore_mod
 
 import vault
 import vault_policy as vp
@@ -316,6 +348,44 @@ ok('wipe reports save failure', (not res) and 'cannot wipe' in msg)
 _FakeSettings.fail_on = None
 res, msg = vault.wipe()
 ok('wipe ok after failures cleared', res)
+
+# --- 11 master-scoping: the policy gate stays ON in tmp-seed sessions -----
+# 'vault' is in nvstore MASTER_FIELDS: leaving_master_seed captures the
+# cfg into master_sv_data, and _cfg() reads via master_get. Before this
+# change, a tmp-seed session read the empty tmp scope and the vault
+# gate silently turned OFF for the whole session.
+vault.save_cfg(dict(CFG, enabled=1))
+ok('master-mode save via master_set', vault._cfg().get('enabled') == 1)
+
+# simulate leaving_master_seed(): tmp session starts, master copy cached
+_FakeSettings.master_nvram_key = b'\x11' * 16
+_FakeSettings.master_sv_data['vault'] = _store['vault']
+ok('cfg visible during tmp session (gate stays on)',
+   vault._cfg().get('enabled') == 1 and vault.is_enabled())
+appr, msg = vault.VaultMode.could_sign(p_emg(seq=0xfffffffe))
+ok('policy still enforced during tmp session', appr is False)
+appr, msg = vault.VaultMode.could_sign(p_emg())     # canonical emergency
+ok('canonical emergency still approved during tmp session', appr)
+
+# a save from tmp mode (API-level, menu normally blocks this) must
+# write the master store, not the discarded tmp scope
+vault.save_cfg(dict(CFG, enabled=1, n=2016))
+ok('tmp-session save goes to master scope',
+   _FakeSettings.master_sv_data['vault']['n'] == 2016)
+
+# a wipe from tmp mode must remove the MASTER copy (a tmp-scope-only
+# removal would leave the policy enforced while claiming it was gone)
+res, msg = vault.wipe()
+ok('tmp-session wipe removes the master copy',
+   res and not _store.get('vault') and
+   'vault' not in _FakeSettings.master_sv_data)
+
+# simulate return_to_master_seed(): tmp scope discarded, master re-read
+_FakeSettings.master_nvram_key = None
+_FakeSettings.master_sv_data.clear()
+ok('back on master: policy gone after tmp wipe', not vault._cfg())
+res, msg = vault.wipe()
+ok('wipe idempotent after tmp session', res)
 
 fails = [n for n, c in R if not c]
 print('VAULT GLUE: %d/%d checks pass' % (len(R) - len(fails), len(R)))
