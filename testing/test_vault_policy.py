@@ -118,6 +118,13 @@ def test_emergency_P1():
     ok_em = view(seq=vp.SEQ_EMERGENCY, out_spks=((SPK_EH, 160218),), vin=162000)
     expect_ok(vp1.check, ok_em)                                  # pins everything, fee 1782
 
+    # out == spk_e but the psbtObject flagged the output as wallet
+    # change: contradictory P1, refuse (is_change is carried by
+    # view_from_psbt on the real-psbtObject path)
+    chg = view(seq=vp.SEQ_EMERGENCY, out_spks=((SPK_EH, 160218),), vin=162000)
+    chg['outputs'][0]['is_change'] = True
+    expect('P1 change', vp1.check, chg)
+
     for bad in [
         view(seq=vp.SEQ_EMERGENCY, out_spks=((SPK_EH, 160218),), vin=162000, lock=5),
         view(seq=vp.SEQ_EMERGENCY, out_spks=((WARM_SPK, 160218),), vin=162000),
@@ -137,6 +144,37 @@ def test_ladder_sequence():
     expect('seq disabled', vp1.check, view(seq=0xFFFFFFFF))
     expect('locktime set', vp1.check, view(lock=900000))
     expect('time form', vp1.check, view(seq=(1 << 22) | 144))
+
+
+def test_cfg_structural_validation():
+    # VaultPolicy.__init__ must fail fast on a mis-enrolled cfg (=> 
+    # validate_cfg 'bad policy' at enroll time, could_sign refuse at
+    # spend time) instead of silently producing an unenforceable or
+    # self-contradictory policy
+    expect_ok(pol)
+
+    # exit_spk == spk_e / sv_hash: P3 exit ceremonies must pay exit_spk
+    # while INV-SINK forbids non-emergency classes paying spk_e/sv_v -
+    # equal values make every exit ceremony unsignable (funds locked in
+    # the sink forever)
+    expect_parse(lambda: pol(exit_spk=SPK_EH.hex()))
+    expect_parse(lambda: pol(exit_spk=SPK_V.hex()))
+
+    # sv_hash/spk_e are P2WSH scriptPubKeys
+    expect_parse(lambda: pol(sv_hash='00'))
+    expect_parse(lambda: pol(sv_hash='0011'))
+    expect_parse(lambda: pol(spk_e='0020' + '11' * 31))
+
+    # k1_pubkey must be a 33-byte compressed pubkey (else the P3
+    # K1-co-signature check can never match)
+    expect_parse(lambda: pol(k1_pubkey='0200'))
+    expect_parse(lambda: pol(k1_pubkey='04' + '00' * 32))
+
+    # cadence N window (height-form CSV) + fee window
+    expect_parse(lambda: pol(n=0))
+    expect_parse(lambda: pol(n=0x10000))
+    expect_parse(lambda: pol(f0_max=0))
+    expect_parse(lambda: pol(f0_max=-1))
 
 
 def test_P2_spend_forbid():

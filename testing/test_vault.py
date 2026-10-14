@@ -70,6 +70,10 @@ enable(dict(CFG, enabled=0)); ok('flag off again', not vault.is_enabled())
 enable(dict(CFG, enabled=1))
 ok('relevant vault in', vault.check_relevance(p_emg(), CFG))
 ok('irrelevant', not vault.check_relevance(p_other(), CFG))
+ok('relevance None cfg (no crash)', not vault.check_relevance(p_other(), None))
+ok('relevance empty cfg', not vault.check_relevance(p_other(), {}))
+ok('relevance bad-hex cfg -> relevant (fail-closed)',
+   vault.check_relevance(p_other(), {'sv_hash': 'zz', 'spk_e': 'zz'}))
 
 # --- 3 auto-approve a canonical emergency -----------------------------------------
 appr, msg = vault.VaultMode.could_sign(p_emg())
@@ -120,6 +124,22 @@ ok('validate rejects empty', not vault.validate_cfg({})[0])
 vault.save_cfg(dict(CFG, sv_hash='zz'))       # unparseable hex
 ok('validate rejects bad hex', not vault.validate_cfg(vault._cfg())[0])
 
+vault.save_cfg(dict(CFG, exit_spk=SPK_E.hex()))
+ok('validate rejects exit_spk == spk_e',
+   not vault.validate_cfg(vault._cfg())[0])
+vault.save_cfg(dict(CFG, exit_spk=SPK_V.hex()))
+ok('validate rejects exit_spk == sv_hash',
+   not vault.validate_cfg(vault._cfg())[0])
+vault.save_cfg(dict(CFG, k1_pubkey='0200'))
+ok('validate rejects bad k1', not vault.validate_cfg(vault._cfg())[0])
+vault.save_cfg(dict(CFG, sv_hash='0011'))
+ok('validate rejects non-p2wsh sv_hash',
+   not vault.validate_cfg(vault._cfg())[0])
+vault.save_cfg(dict(CFG, n=0))
+ok('validate rejects n=0', not vault.validate_cfg(vault._cfg())[0])
+vault.save_cfg(dict(CFG, f0_max=0))
+ok('validate rejects f0_max=0', not vault.validate_cfg(vault._cfg())[0])
+
 vault.save_cfg(dict(CFG))                     # enroll dark
 ok('enrolled dark', not vault.is_enabled())
 r2, m2 = vault.set_enabled(True)
@@ -169,6 +189,81 @@ except vault.VaultViolation:
 vault.store_lattice(root_hex, cnt)
 ok('root stored', vault._cfg().get('lattice_root') == root_hex)
 ok('count stored', vault._cfg().get('lattice_count') == 5)
+
+# --- 9b. real-psbtObject shape: (pos,len) proxies + iterators ------------------
+# vault.view_from_psbt/_iter_input_utxos/enroll_lattice have a second
+# path for the real firmware psbtObject (nSequence from input_iter,
+# witness_utxos as (pos,len) proxies read via get_utxo(), part_sigs =
+# {pubkey: sig} dicts, .txn = (pos,len) proxies). These fixtures mimic
+# that shape so the real path gets host coverage too.
+class RIn:
+    def __init__(s, spk=None, val=None, seq=0xfffffffd, part=None):
+        s.witness_utxo = None if spk is None else (0, 1)   # blank when None
+        s.utxo = None
+        s._o = UTXO(spk, val) if spk is not None else None
+        s.part_sigs = part or {}
+        s._seq = seq
+    def get_utxo(s, idx):
+        assert s._o is not None, 'no utxo'
+        return s._o
+class RTxIn:
+    def __init__(s, seq): s.nSequence = seq
+class ROut:
+    def __init__(s, spk, val): s.scriptPubKey, s.nValue = spk, val
+class RPsbt:
+    def __init__(s, ins, outs, lt=0):
+        s.inputs, s.outputs, s.lock_time = ins, outs, lt
+        s._raw = b''
+    def input_iter(s):
+        for i, n in enumerate(s.inputs): yield i, RTxIn(n._seq)
+    def output_iter(s):
+        for i, o in enumerate(s.outputs): yield i, o
+    def get(s, val): return s._raw[val[0]:val[0] + val[1]]
+
+def r_emg(fee=500):
+    return RPsbt([RIn(SPK_V, 10_000 + fee)], [ROut(SPK_E, 10_000)])
+
+appr, msg = vault.VaultMode.could_sign(r_emg())
+ok('real-path approve emergency', appr)
+ok('real-path class named', 'emergency' in msg.lower())
+
+bad = RPsbt([RIn(SPK_V, 12000, N - 10)], [ROut(WARM_SPK, 11000)])
+appr, msg = vault.VaultMode.could_sign(bad)
+ok('real-path refuse wrong-N ladder', not appr)
+ok('real-path reason seq', 'seq' in msg.lower())
+
+# P1 change contradiction: out == spk_e but psbtObject flagged the
+# output as wallet change (is_change carried into the view)
+chg = r_emg(); chg.outputs[0].is_change = True
+appr, msg = vault.VaultMode.could_sign(chg)
+ok('real-path refuse change-flagged emergency', not appr)
+
+# P3 exit: K1 partial sig in the psbtObject-style part_sigs dict
+K1SIG = b'\x30' + b'\x01' * 70
+ex = RPsbt([RIn(SPK_E, 9600, part={K1: K1SIG})], [ROut(EXIT_SPK, 9000)])
+appr, msg = vault.VaultMode.could_sign(ex)
+ok('real-path approve exit w/ K1 partial', appr)
+ex2 = RPsbt([RIn(SPK_E, 9600, part={K2: K1SIG})], [ROut(EXIT_SPK, 9000)])
+appr, msg = vault.VaultMode.could_sign(ex2)
+ok('real-path refuse exit w/o K1 partial', not appr)
+
+# fail-closed on a missing witness_utxo (real path)
+nu = RPsbt([RIn(SPK_V, 10500), RIn()], [ROut(SPK_E, 10_000)])
+appr, msg = vault.VaultMode.could_sign(nu)
+ok('real-path missing witness_utxo refuses', not appr)
+ok('real-path reason missing utxo', 'witness_utxo' in msg)
+
+# lattice over the real-path shape == lattice over host fakes (same raw
+# global-unsigned-tx bytes, read through the .txn proxy)
+rmem = [r_emg(fee=500 + i) for i in range(5)]
+for i, p in enumerate(rmem):
+    p.txn = (0, 60 + i); p._raw = bytes([i]) * (60 + i)
+rroot_hex, rcnt = vault.enroll_lattice(CFG, rmem)
+ok('real-path lattice root is 64 hex', len(rroot_hex) == 64)
+ok('real-path lattice count', rcnt == 5)
+fmem = [lat_psbt(i, fee=500 + i) for i in range(5)]
+froot_hex, _ = vault.enroll_lattice(CFG, fmem)
+ok('lattice real-path root == fake-path root', rroot_hex == froot_hex)
 
 fails = [n for n, c in R if not c]
 print('VAULT GLUE: %d/%d checks pass' % (len(R) - len(fails), len(R)))

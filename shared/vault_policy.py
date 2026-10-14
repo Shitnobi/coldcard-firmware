@@ -171,6 +171,31 @@ class VaultPolicy:
         self.n = d.get("n", 1008)
         self.f0_max = d.get("f0_max", 10000)
 
+        # Structural sanity, so a mis-enrolled cfg fails at
+        # validate/enroll time instead of silently at spend time:
+        # - S_v/S_e are P2WSH scriptPubKeys; K1 is a compressed pubkey
+        #   (P3's K1 co-signature check can never match otherwise);
+        # - the cadence N must be a valid height-form CSV value;
+        # - f0_max must be a usable positive fee window.
+        # Raise here (=> validate_cfg 'bad policy', could_sign refuse).
+        for nm, spk in (('sv_hash', self.spk_v), ('spk_e', self.spk_e)):
+            if spk is not None and (len(spk) != 34 or spk[:2] != b'\x00\x20'):
+                raise VaultViolation('%s must be a P2WSH scriptPubKey' % nm)
+        if self.k1 is not None and (len(self.k1) != 33 or
+                                    self.k1[0] not in (0x02, 0x03)):
+            raise VaultViolation('k1_pubkey must be a 33-byte compressed pubkey')
+        if self.n is None or not (1 <= self.n <= MAX_CSV_BLOCKS):
+            raise VaultViolation('cadence N must be in 1..%d' % MAX_CSV_BLOCKS)
+        if self.f0_max is None or self.f0_max <= 0:
+            raise VaultViolation('f0_max must be positive')
+        # The exit destination must not be the vault or the sink itself:
+        # P3 requires exit ceremonies to pay exit_spk, while INV-SINK
+        # forbids non-emergency classes paying spk_e/sv_v - exit_spk ==
+        # spk_e (or sv_hash) makes every exit ceremony unsignable, so
+        # funds in the sink could never leave (fail-closed fund-lock).
+        if self.exit_dest and self.exit_dest in (self.spk_v, self.spk_e):
+            raise VaultViolation('exit_spk must differ from sv_hash/spk_e')
+
     def _classify(self, view):
         # view = {lock_time:int, inputs:[{spk,value,sequence,part_sigs}], outputs:[...]}
         spends_e = any(i["spk"] == self.spk_e for i in view["inputs"])
@@ -242,9 +267,9 @@ class VaultPolicy:
         return "ladder: withdrawal (%d sats spent)" % spent
 
     def _check_exit(self, view):
-        # P2 default-refuse; P3 the single exception.
-        if view.get("no_exit"):
-            raise VaultViolation("P2: sink spend forbidden")
+        # P2 (spend-forbid) is enforced structurally: _classify routes
+        # every spk_e-spending tx here, and only the exact P3 shape
+        # below survives; anything else is refused.
         if len(view["inputs"]) != 1 or len(view["outputs"]) != 1:
             raise VaultViolation("P3: ceremonies are 1-in/1-out")
         if view["outputs"][0]["spk"] != self.exit_dest:

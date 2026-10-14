@@ -79,10 +79,15 @@ def _iter_input_utxos(psbt):
 
 def check_relevance(psbt, cfg):
     # A tx must pass policy iff any input spends the vault or the sink.
-    spk_v, spk_e = _h2b(cfg.get('sv_hash')), _h2b(cfg.get('spk_e'))
-    if not (spk_v or spk_e):
-        return False
+    # Never raises: odd shapes - including a missing/unparseable cfg -
+    # are treated as relevant, so the policy layer judges (and refuses)
+    # them (fail-closed). A cfg w/o sv_hash/spk_e cannot match anything
+    # => not relevant.
     try:
+        cfg = cfg or {}
+        spk_v, spk_e = _h2b(cfg.get('sv_hash')), _h2b(cfg.get('spk_e'))
+        if not (spk_v or spk_e):
+            return False
         for spk, val in _iter_input_utxos(psbt):
             if (spk_v and spk == spk_v) \
                     or (spk_e and spk == spk_e):
@@ -114,9 +119,15 @@ def view_from_psbt(psbt):
                 'part_sigs': list(part) if part else [],
             })
         for idx, txo in psbt.output_iter():
+            # carry psbt.outputs[idx].is_change (set by consider_outputs
+            # in the auth.py flow) so P1 can refuse contradictory
+            # "pinned spk_e but marked change" emergencies
+            out = psbt.outputs[idx] if psbt.outputs \
+                and idx < len(psbt.outputs) else None
             view['outputs'].append({
                 'spk': bytes(txo.scriptPubKey),
                 'value': txo.nValue,
+                'is_change': bool(out and getattr(out, 'is_change', None)),
             })
         return view
     for inp in psbt.inputs:
@@ -134,6 +145,7 @@ def view_from_psbt(psbt):
         view['outputs'].append({
             'spk': bytes(o.scriptPubKey),
             'value': getattr(o, 'nValue', None),
+            'is_change': bool(getattr(o, 'is_change', None)),
         })
     return view
 
