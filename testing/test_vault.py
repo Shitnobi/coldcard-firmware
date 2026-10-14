@@ -11,12 +11,23 @@ sys.path.insert(0, os.path.join(HERE, '..', 'shared'))
 _store = {'vault': None}
 
 class _FakeSettings:
+    # save() counts flushes; fail_on injects a simulated flash failure
+    # (PR C: save_cfg/wipe flush immediately and report failures).
+    n_saves = 0
+    fail_on = None
+
     def get(self, k, d=None):
         return _store.get(k, d)
     def set(self, k, v):
         _store[k] = v
     def remove_key(self, k):
+        if _FakeSettings.fail_on == 'rm':
+            raise OSError('sim flash failure')
         _store.pop(k, None)
+    def save(self):
+        if _FakeSettings.fail_on == 'save':
+            raise OSError('sim flash failure')
+        _FakeSettings.n_saves += 1
 
 glob_mod = types.ModuleType('glob')
 glob_mod.settings = _FakeSettings()
@@ -264,6 +275,44 @@ ok('real-path lattice count', rcnt == 5)
 fmem = [lat_psbt(i, fee=500 + i) for i in range(5)]
 froot_hex, _ = vault.enroll_lattice(CFG, fmem)
 ok('lattice real-path root == fake-path root', rroot_hex == froot_hex)
+# --- 10 save/wipe persistence hardening (menu integration) --------------
+_FakeSettings.fail_on = None
+
+_store['vault'] = 'garbage-not-a-dict'    # corrupt stored value
+ok('non-dict cfg -> {} (no AttributeError in menu/signing)',
+   vault._cfg() == {})
+ok('non-dict cfg not enabled', not vault.is_enabled())
+ok('non-dict cfg not strict', not vault.is_strict())
+
+vault.save_cfg(dict(CFG, n=200))
+n0 = _FakeSettings.n_saves
+vault.save_cfg(dict(CFG, n=201))
+ok('save_cfg flushes immediately (no 250ms deferred window)',
+   _FakeSettings.n_saves == n0 + 1)
+ok('save_cfg stores value', vault._cfg().get('n') == 201)
+
+res, msg = vault.wipe()
+ok('wipe ok + flushed', res and _FakeSettings.n_saves == n0 + 2)
+ok('wiped (2)', not vault._cfg())
+ok('enable refused after wipe (2)', not vault.set_enabled(True)[0])
+
+_FakeSettings.fail_on = 'rm'
+res, msg = vault.wipe()
+ok('wipe reports remove failure (not silently swallowed)',
+   (not res) and 'cannot wipe' in msg)
+
+_FakeSettings.fail_on = 'save'
+try:
+    vault.save_cfg(dict(CFG))
+    ok('save_cfg propagates save errors (enroll menu reports them)', False)
+except OSError:
+    ok('save_cfg propagates save errors (enroll menu reports them)', True)
+res, msg = vault.wipe()
+ok('wipe reports save failure', (not res) and 'cannot wipe' in msg)
+
+_FakeSettings.fail_on = None
+res, msg = vault.wipe()
+ok('wipe ok after failures cleared', res)
 
 fails = [n for n, c in R if not c]
 print('VAULT GLUE: %d/%d checks pass' % (len(R) - len(fails), len(R)))

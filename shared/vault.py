@@ -27,9 +27,12 @@ VAULT_LOG = 'vault.log'
 
 
 def _cfg():
+    # Always returns a dict: a corrupt (non-dict) stored value must not
+    # crash menu/signing code with AttributeError halfway through.
     try:
         from glob import settings
-        return settings.get('vault') or {}
+        v = settings.get('vault')
+        return v if isinstance(v, dict) else {}
     except Exception:
         return {}
 
@@ -200,17 +203,28 @@ def validate_cfg(cfg):
 
 def save_cfg(cfg):
     # Persist the vault settings dict under settings key 'vault'.
+    # - immediate save: nvstore.set() (=put) only marks the store dirty
+    #   with a 250ms deferred write, so power loss in that window would
+    #   silently lose the change. Enrollment data is security-critical;
+    #   ccc.py/sssp.py write their policy settings via master_set(),
+    #   which always saves immediately. Same guarantee here.
     from glob import settings
     settings.set('vault', cfg)
+    settings.save()
 
 
 def wipe():
     # Remove the vault policy entirely. Cannot be undone.
+    # Returns (ok, msg); never raises: a policy that survives a
+    # "successful" wipe keeps constraining signing, so the menu must be
+    # able to report the failure instead of a silently swallowed one.
     try:
         from glob import settings
         settings.remove_key('vault')
-    except Exception:
-        pass
+        settings.save()
+    except Exception as e:
+        return False, 'cannot wipe: %s' % (e,)
+    return True, 'ok'
 
 
 def set_enabled(on):

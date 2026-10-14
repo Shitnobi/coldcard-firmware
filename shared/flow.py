@@ -410,7 +410,10 @@ SpendingPolicySubMenu = [
     NonDefaultMenuItem('Single-Signer', 'sssp', f=sssp_feature_menu, predicate=has_real_secret),
     NonDefaultMenuItem('Co-Sign Multi.' if not version.has_qwerty else 'Co-Sign Multisig (CCC)',
                 'ccc', f=toggle_ccc_feature, predicate=is_not_tmp),
-    MenuItem('Vault Co-Sign', f=vault_feature_menu),
+    # - predicate: settings are stored with the ACTIVE seed, so a
+    #   tmp-seed session would enroll/enable a policy that silently
+    #   disappears on return to the master seed.
+    MenuItem('Vault Co-Sign', f=vault_feature_menu, predicate=is_not_tmp),
     ToggleMenuItem('HSM Mode', 'hsmcmd', ['Default Off', 'Enable'],
        story=("Enable HSM? Enables all user management commands, and other HSM-only USB commands. "
               "By default these commands are disabled."),

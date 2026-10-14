@@ -94,6 +94,13 @@ class VaultConfigMenu(MenuSystem):
             await ux_show_story('Policy rejected:\n\n%s' % msg, title='VAULT')
             return
 
+        # Commitment data may only come from the confirmed 'Enroll
+        # Lattice' flow (device root shown, compared to the host, then
+        # stored). Strip it from the file so a hostile or stale policy
+        # JSON cannot pre-load an unconfirmed lattice root.
+        for k in ('lattice_root', 'lattice_count'):
+            cfg.pop(k, None)
+
         cfg['enabled'] = 0
         try:
             vault.save_cfg(cfg)
@@ -108,23 +115,49 @@ class VaultConfigMenu(MenuSystem):
 
     async def set_n(self, *a):
         cfg = vault._cfg()
+        if not vault.validate_cfg(cfg)[0]:
+            await ux_show_story('Enroll a valid policy first.', title='VAULT')
+            return
         val = await ux_enter_number('Cadence N (blocks):', max_value=0xFFFF,
                                     value=cfg.get('n', 1008))
         if not val:
             return
         cfg['n'] = int(val)
-        vault.save_cfg(cfg)
+        # fail-closed editor: refuse to persist any edit that would leave
+        # the (possibly already enabled) policy unvalidatable.
+        res, msg = vault.validate_cfg(cfg)
+        if not res:
+            await ux_show_story('Cannot change Cadence N:\n\n%s' % msg,
+                                title='VAULT')
+            return
+        try:
+            vault.save_cfg(cfg)
+        except Exception as e:
+            await ux_show_story('Cannot save policy: %s' % e, title='VAULT')
+            return
         vault.vault_log('CFG n=%d' % cfg['n'])
         self.update_contents()
 
     async def set_fee(self, *a):
         cfg = vault._cfg()
+        if not vault.validate_cfg(cfg)[0]:
+            await ux_show_story('Enroll a valid policy first.', title='VAULT')
+            return
         val = await ux_enter_number('Max fee (sats):', max_value=1000000,
                                     value=cfg.get('f0_max', 10000))
         if not val:
             return
         cfg['f0_max'] = int(val)
-        vault.save_cfg(cfg)
+        res, msg = vault.validate_cfg(cfg)
+        if not res:
+            await ux_show_story('Cannot change Max Fee:\n\n%s' % msg,
+                                title='VAULT')
+            return
+        try:
+            vault.save_cfg(cfg)
+        except Exception as e:
+            await ux_show_story('Cannot save policy: %s' % e, title='VAULT')
+            return
         vault.vault_log('CFG f0_max=%d' % cfg['f0_max'])
         self.update_contents()
 
@@ -187,7 +220,11 @@ class VaultConfigMenu(MenuSystem):
                             root_hex[:8], root_hex[-8:]), title='VAULT')
         if not await ux_confirm('Root matches host?'):
             return
-        vault.store_lattice(root_hex, count)
+        try:
+            vault.store_lattice(root_hex, count)
+        except Exception as e:
+            await ux_show_story('Cannot store lattice: %s' % e, title='VAULT')
+            return
         await ux_show_story('Lattice commitment stored (%d leaves).' % count,
                             title='VAULT')
         self.update_contents()
@@ -195,7 +232,13 @@ class VaultConfigMenu(MenuSystem):
     async def wipe(self, *a):
         if not await ux_confirm('Wipe vault policy?'):
             return
-        vault.wipe()
+        res, msg = vault.wipe()
+        if not res:
+            # never claim success: a policy that survives the wipe keeps
+            # constraining signing.
+            await ux_show_story('Cannot wipe policy:\n\n%s' % msg,
+                                title='VAULT')
+            return
         vault.vault_log('CFG wiped')
         self.update_contents()
 
