@@ -192,6 +192,7 @@ class VaultConfigMenu(MenuSystem):
             return
 
         psbts = []
+        card_dir = None
         while True:
             fn = await file_picker(suffix=['.psbt'], min_size=10, max_size=200000,
                                    none_msg='PSBT lattice member (%d loaded)'
@@ -205,9 +206,43 @@ class VaultConfigMenu(MenuSystem):
             except Exception as e:
                 await ux_show_story('Cannot read PSBT: %s' % e, title='VAULT')
                 return
+            card_dir = fn[:fn.rfind('/')] if '/' in fn else ''
 
         if not psbts:
             return
+
+        # Decision B (b): cross-check the leaves against the host's
+        # manifest.json from the same card directory - every leaf must
+        # spend the declared deposit outpoint, the count must match, and
+        # the manifest cfg must agree with the enrolled policy.
+        manifest = None
+        try:
+            with CardSlot(readonly=True) as card:
+                with open((card_dir + '/' if card_dir else '') +
+                          'manifest.json', 'rt') as fd:
+                    import json
+                    manifest = json.loads(fd.read())
+            if not isinstance(manifest, dict):
+                manifest = None
+        except OSError:
+            manifest = None            # no manifest beside the leaves
+        except Exception as e:
+            await ux_show_story('Cannot parse manifest.json:\n\n%s' % e,
+                                title='VAULT')
+            return
+
+        if manifest is None:
+            if not await ux_confirm('No manifest.json beside the PSBTs.\n\n'
+                                    'Deposit binding NOT cross-checked. '
+                                    'Proceed anyway?'):
+                return
+        else:
+            try:
+                vault.check_lattice_binding(manifest, psbts, cfg=cfg)
+            except Exception as e:
+                await ux_show_story('Lattice rejected (manifest):\n\n%s' % e,
+                                    title='VAULT')
+                return
 
         try:
             root_hex, count = vault.enroll_lattice(cfg, psbts)
@@ -215,9 +250,12 @@ class VaultConfigMenu(MenuSystem):
             await ux_show_story('Lattice rejected:\n\n%s' % e, title='VAULT')
             return
 
-        await ux_show_story('Lattice: %d leaves\n\nRoot: %s...%s\n\n'
-                            'Compare against the host root.' % (count,
-                            root_hex[:8], root_hex[-8:]), title='VAULT')
+        await ux_show_story('Lattice: %d leaves\n\nRoot: %s...%s\n\n%s'
+                            % (count, root_hex[:8], root_hex[-8:],
+                               'Deposit binding verified (manifest).'
+                               if manifest else
+                               'Deposit binding NOT verified (no manifest).'),
+                            title='VAULT')
         if not await ux_confirm('Root matches host?'):
             return
         try:

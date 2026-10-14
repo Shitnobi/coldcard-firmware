@@ -38,6 +38,7 @@ if s.get('vault', None):
     s.save()
 
 import json
+import binascii
 import vault
 import vault_policy as vp
 from psbt import psbtObject
@@ -111,6 +112,59 @@ except OSError:
     pass          # this tree has no ladder_bad.psbt; check not applicable
 except vp.VaultViolation as e:
     ok('bad lattice member refused', 'lattice[1]' in str(e))
+
+# --- 2b. manifest cross-check (Decision B, choice b) --------------------
+# hostapp trees ship manifest.json declaring the deposit outpoint every
+# leaf must spend; generator trees don't, so exercise the same machinery
+# with leaf 0's own (real-psbtObject) outpoint.
+if exp.get('deposit_txid') is not None:
+    man = {'deposit_txid': exp['deposit_txid'], 'vault_vout': exp['vault_vout'],
+           'lattice_count': exp['lattice_count'], 'cfg': exp['cfg']}
+    try:
+        vault.check_lattice_binding(man, members, cfg=cfg)
+        ok('manifest binding: full batch spends declared outpoint', True)
+    except vp.VaultViolation as e:
+        ok('manifest binding: full batch spends declared outpoint', False)
+        print('      %s' % e)
+    for name, bad in [
+        ('wrong vault_vout refused', dict(man, vault_vout=man['vault_vout'] + 1)),
+        ('wrong deposit_txid refused', dict(man, deposit_txid='ee' * 32)),
+        ('leaf count mismatch refused', dict(man, lattice_count=cnt + 1)),
+        ('cfg divergence refused', dict(man, cfg=dict(exp['cfg'], n=999))),
+    ]:
+        try:
+            vault.check_lattice_binding(bad, members, cfg=cfg)
+            ok('manifest binding: %s' % name, False)
+        except vp.VaultViolation:
+            ok('manifest binding: %s' % name, True)
+else:
+    # generator tree: leaves have distinct prevouts, so build the
+    # manifest from leaf 0's own outpoint (real psbtObject -> CTxIn ->
+    # COutPoint: exercises the int<->bytes / display-order conversion).
+    _txin = list(members[0].input_iter())[0][1]
+    _txid_disp = str(binascii.hexlify(
+        bytes(reversed(_txin.prevout.hash.to_bytes(32, 'little')))), 'ascii')
+    man = {'deposit_txid': _txid_disp, 'vault_vout': _txin.prevout.n,
+           'lattice_count': 1}
+    try:
+        vault.check_lattice_binding(man, [members[0]])
+        ok('manifest binding: leaf-0 outpoint passes (byte order ok)', True)
+    except vp.VaultViolation as e:
+        ok('manifest binding: leaf-0 outpoint passes (byte order ok)', False)
+        print('      %s' % e)
+    for name, bad, psbts in [
+        ('wrong vault_vout refused', dict(man, vault_vout=_txin.prevout.n + 1),
+         [members[0]]),
+        ('wrong deposit_txid refused', dict(man, deposit_txid='ee' * 32),
+         [members[0]]),
+        ('leaf count mismatch refused', dict(man, lattice_count=2), [members[0]]),
+        ('leaf with different prevout refused', man, members),
+    ]:
+        try:
+            vault.check_lattice_binding(bad, psbts)
+            ok('manifest binding: %s' % name, False)
+        except vp.VaultViolation:
+            ok('manifest binding: %s' % name, True)
 
 # --- 3. the signing choke point (exact call auth.py makes) ---------------
 for fname, want, sub, note in exp['expect']:

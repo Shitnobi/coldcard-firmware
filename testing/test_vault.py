@@ -93,8 +93,9 @@ CFG = dict(n=N, sv_hash=SPK_V.hex(), spk_e=SPK_E.hex(),
 class UTXO:
     def __init__(s, spk, val): s.scriptPubKey, s.nValue = spk, val
 class Inp:
-    def __init__(s, spk, val, seq, part=None):
+    def __init__(s, spk, val, seq, part=None, prev=None):
         s.utxo = UTXO(spk, val); s.sequence = seq; s.part_sigs = part or []
+        s.prevout = prev
 class Out:
     def __init__(s, spk, val): s.scriptPubKey, s.nValue = spk, val
 class P:
@@ -386,6 +387,62 @@ _FakeSettings.master_sv_data.clear()
 ok('back on master: policy gone after tmp wipe', not vault._cfg())
 res, msg = vault.wipe()
 ok('wipe idempotent after tmp session', res)
+
+# --- 12 manifest cross-check (Decision B, choice b) ----------------------
+# check_lattice_binding: every leaf input must spend the manifest-declared
+# deposit outpoint; count and policy-defining cfg fields must agree.
+class Prev:
+    def __init__(s, h, n): s.hash, s.n = h, n
+DEP = b'\xab' * 32                       # internal byte order
+DEP_DISP = DEP[::-1].hex()               # display order, as hostapp writes
+def p_leaf(vout=1, txid=DEP, extra_foreign=False):
+    ins = [Inp(SPK_V, 10_500, 0xfffffffd, prev=Prev(txid, vout))]
+    if extra_foreign:
+        ins.append(Inp(WARM_SPK, 5000, 0xfffffffd, prev=Prev(b'\xcd' * 32, 0)))
+    return P(ins, [Out(SPK_E, 10_000)])
+MAN1 = {'deposit_txid': DEP_DISP, 'vault_vout': 1, 'lattice_count': 1, 'cfg': CFG}
+MAN2 = dict(MAN1, lattice_count=2)
+
+try:
+    vault.check_lattice_binding(MAN2, [p_leaf(), p_leaf()], cfg=CFG)
+    ok('manifest binding: matching leaves pass', True)
+except vp.VaultViolation as e:
+    ok('manifest binding: matching leaves pass', False); print('      %s' % e)
+
+for name, man, psbts, chk_cfg, want_pass in [
+    ('wrong vault_vout refused',
+     dict(MAN2, vault_vout=2), [p_leaf(), p_leaf()], CFG, False),
+    ('wrong deposit_txid refused',
+     dict(MAN1, deposit_txid='ee' * 32), [p_leaf()], CFG, False),
+    ('leaf count mismatch refused',
+     dict(MAN2, lattice_count=3), [p_leaf(), p_leaf()], CFG, False),
+    ('missing deposit_txid refused',
+     {'vault_vout': 1}, [p_leaf()], CFG, False),
+    ('missing vault_vout refused',
+     {'deposit_txid': DEP_DISP}, [p_leaf()], CFG, False),
+    ('short deposit_txid refused',
+     dict(MAN1, deposit_txid='abcd'), [p_leaf()], CFG, False),
+    ('leaf with foreign second input refused',
+     MAN1, [p_leaf(extra_foreign=True)], CFG, False),
+    ('leaf without prevout refused',
+     MAN1, [p_emg()], CFG, False),
+    ('cfg divergence refused (n)',
+     dict(MAN1, cfg=dict(CFG, n=999)), [p_leaf()], CFG, False),
+    ('cfg divergence refused (sv_hash)',
+     dict(MAN1, cfg=dict(CFG, sv_hash='00' * 32)), [p_leaf()], CFG, False),
+    ('manifest cfg absent: outpoint check still runs',
+     {'deposit_txid': DEP_DISP, 'vault_vout': 1,
+      'lattice_count': 1}, [p_leaf()], CFG, True),
+    ('cfg=None skips cfg comparison entirely',
+     dict(MAN1, cfg=dict(CFG, n=999)), [p_leaf()], None, True),
+]:
+    try:
+        vault.check_lattice_binding(man, psbts, cfg=chk_cfg)
+        ok('manifest binding: %s' % name, want_pass)
+    except vp.VaultViolation as e:
+        ok('manifest binding: %s' % name, not want_pass)
+    except Exception as e:
+        ok('manifest binding: %s' % name, False); print('      %s' % e)
 
 fails = [n for n, c in R if not c]
 print('VAULT GLUE: %d/%d checks pass' % (len(R) - len(fails), len(R)))

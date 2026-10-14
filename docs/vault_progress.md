@@ -304,3 +304,89 @@ real PSBT tx bytes: `8317744dbdd8cb62975ede46c71874681de147bcc95a6c6e3e`
   sim e2e 20/20; app-tree e2e 14/14; smoke 14/14.
 - Decision B (device-side vault_vout cross-check) deliberately NOT
   implemented yet per maintainer instruction.
+
+## Session 2026-10-14 (h) — DECISION B implemented: manifest cross-check (choice b)
+
+- **`vault.check_lattice_binding(manifest, psbts, cfg=None)`** (new,
+  shared/vault.py): the device parses the host's `manifest.json` and
+  verifies, before accepting a lattice batch:
+  1. every input of every picked leaf spends exactly the declared
+     deposit outpoint (`deposit_txid` - display-order hex, converted to
+     internal byte order - plus `vault_vout`); per-leaf and per-input
+     indexed error messages;
+  2. the leaf count equals the manifest's `lattice_count` (subset
+     enrollment is refused: the ceremony expects the full lattice);
+  3. (when the enrolled cfg is passed in) the manifest's `cfg` agrees
+     with the device policy on every policy-defining field
+     (n/sv_hash/spk_e/k1_pubkey/f0_max/exit_spk) - catches silent
+     host-vs-device policy divergence (issue #4 family).
+  Raises VaultViolation on any mismatch; never writes settings.
+- **Menu wiring** (vault_menu.enroll_lattice): after the PSBT picking
+  loop, `manifest.json` is read from the same card directory (derived
+  from the last picked filename; card idiom `bytes(reversed(x))` for
+  byte reversal - MicroPython has no step=-1 slices, caught by the sim).
+  Manifest present + binding mismatch => loud refusal. Manifest absent
+  => explicit "Deposit binding NOT cross-checked. Proceed anyway?"
+  confirm (other tooling can still enroll; the user is told exactly
+  what was not verified). Corrupt/unparseable manifest => refusal.
+  The root-display story now states whether the binding was verified.
+- **Byte-order details**: real psbtObject prevouts come from
+  `input_iter()` -> CTxIn -> COutPoint (`.hash` is the deser_uint256
+  int, `.n` the vout); `int.to_bytes(32,'little')` recovers internal
+  order (in-tree precedent multisig.py). Host-test fakes duck-type
+  `.prevout.hash` as internal-order bytes.
+- **Trust boundary (documented in code)**: the manifest is host-
+  authored, so this catches only INCONSISTENT lying - a host that
+  builds bad leaves and a matching manifest passes. The real
+  commitments remain the device-side policy check and the
+  device-computed Merkle root compared by the human against the host
+  UI. See the unchosen-paths note below for the stronger design.
+- Tests: glue section 12 (13 checks: positive, wrong vout/txid, count
+  mismatch, missing/short txid, foreign second input, missing prevout,
+  cfg divergence x2, cfg-less manifest, cfg=None skip); sim e2e section
+  2b - app-tree: full-batch binding + 4 refusals against the REAL
+  manifest; generator tree: leaf-0 outpoint reconstruction (real
+  psbtObject byte-order path) + 4 refusals. One test-construction bug
+  caught during development: single-leaf rows initially inherited
+  `lattice_count: 2` and failed on count (right verdict, wrong reason)
+  - fixed so each row exercises its intended check.
+- Test reality (one run): policy 9/9; glue 89/89; hostapp 113/113;
+  sim e2e 25/25; app-tree e2e 19/19; smoke 14/14.
+
+### Unchosen design paths (recorded per maintainer request)
+
+**Decision A - where the vault cfg lives (chosen: master-scoped):**
+- *(a, unchosen) per-seed cfg + menu predicate only*: zero nvstore
+  work, but the policy gate would be silently ABSENT during tmp-seed
+  sessions (plain `get` reads the empty tmp scope) - a security policy
+  with quiet windows. Benign to funds (tmp seed cannot produce K1
+  sigs) but wrong-looking.
+- *(c, unchosen) hybrid master-scoped registry of per-seed policies*:
+  a master-level list of `{master xfp, seed xfp, cfg}` entries allowing
+  several vaults per device across seed switches. Deferred: one vault
+  per dedicated co-signer device is the current model; revisit if a
+  device ever hosts multiple vaults (adds registry lookup at every
+  gate check + selection UX at enrollment).
+
+**Decision B - verifying the leaves against the deposit (chosen: (b)
+manifest cross-check):**
+- *(a, unchosen) batch-consistency-only*: check the leaves agree with
+  EACH OTHER (same declared outpoint across the batch) without a
+  manifest. Catches accidental mixed batches; trusts nothing about the
+  host's intent. Strictly weaker than (b) - subsumed by it.
+- *(strongest, unchosen) PSBT-vs-PSBT chaining*: the host also ships
+  `deposit.psbt`; the device parses it (real psbtObject, i.e.
+  device-judged data, NOT host-authored JSON) and derives the deposit
+  txid + vault vout + S_v script itself, optionally recomputing the
+  Merkle root over the deposit's output script to bind the lattice to
+  a PSBT-level commitment. No host-authored string ever becomes a
+  trust root; the manifest demotes to a human-comparison convenience.
+  Cost: one more file on the card, slightly longer ceremony, and the
+  device must still trust the user picked the right deposit.psbt -
+  which the on-screen root/txid comparison already handles. RECOMMENDED
+  follow-up if the manifest check ever proves insufficient.
+- *(c, unchosen) status quo*: enroll_lattice policy-validates leaves
+  and displays the device-computed root; the human compares roots.
+  Sufficient under the recovery-key invariant (mis-enrollment cannot
+  strand funds: 2-of-3 with one unencumbered key), which is exactly
+  why the weaker (b) was acceptable to ship now.

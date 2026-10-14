@@ -294,6 +294,76 @@ def enroll_lattice(cfg, psbt_iter):
     return _b2h(root), count
 
 
+def _iter_outpoints(psbt):
+    # Yield (hash, vout) for every tx input, both PSBT shapes:
+    #  - real firmware psbtObject: input_iter() -> CTxIn; prevout.hash is
+    #    the uint256 int from deser_uint256 = internal byte order
+    #  - host-test fakes: duck-typed .prevout with .hash (bytes in
+    #    internal byte order) and .n
+    # Raises VaultViolation when a fake input carries no prevout (the
+    # binding check must fail closed, not skip silently).
+    if hasattr(psbt, 'input_iter') and hasattr(psbt, 'output_iter'):
+        for idx, txin in psbt.input_iter():
+            yield txin.prevout.hash, txin.prevout.n
+    else:
+        for inp in psbt.inputs:
+            po = getattr(inp, 'prevout', None)
+            if po is None:
+                raise VaultViolation('missing prevout')
+            yield po.hash, po.n
+
+
+def check_lattice_binding(manifest, psbt_iter, cfg=None):
+    # Manifest cross-check (Decision B, choice b). hostapp/vault_tree.py
+    # writes manifest.json next to the leaf PSBTs, declaring the deposit
+    # outpoint every leaf must spend (deposit_txid = DISPLAY-order hex,
+    # vault_vout), the leaf count, and the cfg the host built against.
+    # Before the batch is accepted we verify the parsed leaves actually
+    # spend that outpoint, that the count matches, and (when cfg is
+    # given) that the enrolled policy agrees with the manifest's cfg on
+    # every policy-defining field - so a leaf set and manifest that
+    # disagree (host bug, or either file swapped on the card) is refused
+    # loudly instead of silently committing the wrong thing.
+    #
+    # TRUST BOUNDARY: the manifest is host-authored. This check catches
+    # only INCONSISTENT lying (leaves vs manifest); a host that builds
+    # bad leaves and an honest-looking manifest passes. The real
+    # commitments remain the device-side policy check and the
+    # device-computed Merkle root compared by the human against the host
+    # UI. See docs/vault_progress.md session (h) for the unchosen
+    # stronger designs.
+    #
+    # Raises VaultViolation on any mismatch. Never writes settings.
+    manifest = manifest or {}
+    want_txid = _h2b(manifest.get('deposit_txid'))
+    want_vout = manifest.get('vault_vout')
+    if not want_txid or len(want_txid) != 32 or want_vout is None:
+        raise VaultViolation('manifest: missing or invalid '
+                             'deposit_txid / vault_vout')
+    want_txid = bytes(reversed(want_txid))    # display -> internal order
+    psbts = list(psbt_iter)
+    want_count = manifest.get('lattice_count')
+    if want_count is not None and len(psbts) != want_count:
+        raise VaultViolation('manifest: %d leaves picked but declares '
+                             'lattice_count=%d' % (len(psbts), want_count))
+    for i, psbt in enumerate(psbts):
+        for j, (h, n) in enumerate(_iter_outpoints(psbt)):
+            hb = h.to_bytes(32, 'little') if isinstance(h, int) else bytes(h)
+            if hb != want_txid or n != want_vout:
+                raise VaultViolation('lattice[%d] input %d does not spend '
+                                     'the deposit outpoint declared in '
+                                     'manifest' % (i, j))
+    if cfg is not None:
+        mc = manifest.get('cfg')
+        if isinstance(mc, dict):
+            for k in ('n', 'sv_hash', 'spk_e', 'k1_pubkey', 'f0_max',
+                      'exit_spk'):
+                if k in mc and str(mc[k]) != str(cfg.get(k)):
+                    raise VaultViolation('manifest: cfg %s = %r but device '
+                                         'policy has %r' % (k, mc[k],
+                                                            cfg.get(k)))
+
+
 def store_lattice(root_hex, count):
     # T5 step 6: persist the commitment. Call ONLY after the user has
     # confirmed device-root == host-root on screen.
