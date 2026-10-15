@@ -722,3 +722,48 @@ The two host app copies produced byte-equivalent trees for equal
 policies (device derived the same K2, both enrollments hit the same
 lattice-root machinery), confirming the sync invariant on-chain.
 No bitcoind/sim processes left behind; temp datadir cleaned.
+
+## (p) Coverage-gap round: 4 new on-chain flows + repo sync invariant
+
+Session 2026-10-15 (cont). A coverage-gap review of the test framework
+found six gaps; all closed:
+
+1. **already-correct funding mode was never tested on-chain** (the
+   only mode where the hostapp commits to a PRE-EXISTING txid - the
+   HA-8 clean-serialization risk). New flow B: the wallet funds the
+   vault directly (0-value OP_RETURN at vout 0 so the vault output
+   sits at vout 1 - nonzero vault_vout, previously unreachable with
+   standard outputs), the hostapp gets the funding PSBT with a STRAY
+   WITNESS MARKER injected into the global tx (non-compliant producer
+   shape) and must classify 'already-correct' with manifest txid ==
+   the REAL on-chain funding txid. Both app copies; emergency
+   co-sign + broadcast on the firmware copy.
+2. **CSV ladder recovery never proven against a hostapp deposit** (the
+   oracle's ladder coverage funds S_v directly, bypassing the host
+   app). New flow C: a host-constructed P2 ladder spend of a hostapp
+   deposit is device-co-signed, REFUSED by testmempoolaccept
+   pre-maturity ('non-BIP68-final'), accepted after mining N=1008
+   blocks, broadcast and mined.
+3. **multi-input funding** never exercised (every prior test used a
+   single input). Flow C funds from two wallet coins: input map
+   multiplicity, total_in summing, wallet signing 2 inputs, on-chain
+   txid == prediction.
+4. **signer-set variation**: only the {K1, K2} 2-of-3 set had ever
+   been co-signed. Flow B's emergency spend uses K3 as the user key
+   ({K2, K3} set), proving the finalize witness ordering with a
+   non-K1 partial signature.
+5. **GUI logic layer never run against real funding**: new flow D
+   runs gui.policy_from_fields + gui.run_build (the exact calls the
+   Build button makes) on flow B's real funding bytes - deposit.psbt,
+   every emg leaf and manifest.json byte-identical to the CLI build.
+6. **repo sync invariant was manual**: new testing/test_repo_sync.py
+   (7/7): vault_policy.py byte-identical across repos; vault_tree.py
+   and test_vault_hostapp.py identical as code (wiring comments and
+   sys.path lines excepted, with live wiring checks so a passing
+   normalize cannot hide a broken copy); GUI standalone-only.
+
+vault_hostapp_regtest.py restructured into four flows (A input-only /
+B already-correct / C multi-input+ladder / D GUI parity), 90/90
+checks. One driver bug found and fixed during the run (BIP-174
+output-map count: a 2-output funding PSBT needs two empty output
+maps; Core's walletprocesspsbt caught it - TX decode failed).
