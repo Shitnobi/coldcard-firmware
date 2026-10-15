@@ -276,7 +276,7 @@ def vault_missing_roles(kind, wscript, signed_pks):
     return [i for i, k in enumerate(keys) if k not in signed_pks]
 
 
-def build_witness(kind, wscript, sigs_by_pk, sequence):
+def build_witness(kind, wscript, sigs_by_pk, sequence, selector=None):
     # Construct the final witness stack for a vault input.
     #
     # Stack order requirements (verified empirically against a minimal
@@ -296,8 +296,10 @@ def build_witness(kind, wscript, sigs_by_pk, sequence):
     #          directly beneath it, so K1's signature must be the TOPMOST
     #          signature. The OP_1/OP_2 CHECKMULTISIG consumes one dummy
     #          before the remaining sig.
-    # The selector is derived from nSequence - exactly the fact the policy
-    # gate verified - so the device constructs the branch it approved.
+    # The selector comes from the policy approval record (plan section
+    # 1.5: the device constructs the branch it approved); when absent
+    # (host tests / direct finalize calls) it is derived from nSequence,
+    # which is exactly the fact the policy gate verified.
     keys = script_keys(kind, wscript)
     stack = [b'']                           # CHECKMULTISIG dummy
     if kind == 'se':
@@ -310,8 +312,10 @@ def build_witness(kind, wscript, sigs_by_pk, sequence):
             raise VaultViolation('witness: missing sig for key #%d' % i)
         stack.append(bytes(sig))
     if kind == 'sv':
-        cls, _n = sequence_class(sequence)
-        stack.append(b'\x01' if cls in ('csv', 'csv_time') else b'')
+        if selector is None:
+            cls, _n = sequence_class(sequence)
+            selector = 1 if cls in ('csv', 'csv_time') else 0
+        stack.append(b'\x01' if selector else b'')
     stack.append(bytes(wscript))
     return stack
 

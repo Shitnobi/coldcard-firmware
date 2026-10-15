@@ -2297,6 +2297,65 @@ class psbtObject(psbtProxy):
         der_sig = ser_sig_der(r, s, sighash)
         return der_sig
 
+    def _check_vault_approval(self):
+        # Plan section 1.5: bind the policy gate's decision to the
+        # signature. Vault inputs may only be signed under the approval
+        # record vault.VaultMode.could_sign left on THIS object, and the
+        # transaction facts at signing time (input kinds, outpoints,
+        # outputs, fee, sighash types, branch selector) must still match
+        # what was approved. Fails closed with FatalPSBTIssue.
+        rec = getattr(self, 'vault_approval', None)
+        vault_seen = False
+        for idx, txi in self.input_iter():
+            inp = self.inputs[idx]
+            if not getattr(inp, 'is_vault', None):
+                continue
+            vault_seen = True
+            if not isinstance(rec, dict):
+                raise FatalPSBTIssue(
+                    'vault input #%d: no policy approval record - the '
+                    'vault gate must approve before signing' % idx)
+            kinds = rec.get('kinds') or []
+            want = kinds[idx] if idx < len(kinds) else None
+            if want != inp.is_vault:
+                raise FatalPSBTIssue(
+                    'vault input #%d: policy kind mismatch (approved %r, '
+                    'signing %r)' % (idx, want, inp.is_vault))
+            ops = rec.get('outpoints')
+            if ops is not None:
+                if idx >= len(ops) or \
+                        (txi.prevout.hash, txi.prevout.n) != ops[idx]:
+                    raise FatalPSBTIssue(
+                        'vault input #%d: outpoint differs from the '
+                        'approved policy decision' % idx)
+            shs = rec.get('sighashes') or []
+            want_sh = shs[idx] if idx < len(shs) else 1
+            if (getattr(inp, 'sighash', None) or 1) != want_sh:
+                raise FatalPSBTIssue(
+                    'vault input #%d: sighash type differs from the '
+                    'approved policy decision' % idx)
+            if inp.is_vault == 'sv' and rec.get('selector') is not None:
+                import vault_policy
+                cls, _n = vault_policy.sequence_class(txi.nSequence)
+                if (1 if cls in ('csv', 'csv_time') else 0) != rec['selector']:
+                    raise FatalPSBTIssue(
+                        'vault input #%d: branch selector differs from '
+                        'the approved policy decision' % idx)
+        if not vault_seen:
+            return
+        # tx-wide facts: outputs and fee
+        want_outs = rec.get('out_spks')
+        if want_outs is not None:
+            got = [bytes(txo.scriptPubKey) for _, txo in self.output_iter()]
+            if got != [bytes(w) for w in want_outs]:
+                raise FatalPSBTIssue(
+                    'outputs differ from the approved policy decision')
+        want_fee = rec.get('fee')
+        got_fee = self.calculate_fee()
+        if want_fee is not None and got_fee is not None and want_fee != got_fee:
+            raise FatalPSBTIssue('fee differs from the approved policy '
+                                 'decision (%d vs %d)' % (got_fee, want_fee))
+
     def sign_it(self, alternate_secret=None, my_xfp=None):
         # txn is approved. sign all inputs we can sign. add signatures
         # - hash the txn first
@@ -2309,6 +2368,10 @@ class psbtObject(psbtProxy):
 
         if my_xfp is None:
             my_xfp = self.my_xfp
+
+        # section 1.5: refuse (fail-closed) unless the vault gate's
+        # approval record is present and still matches this transaction
+        self._check_vault_approval()
 
         with stash.SensitiveValues(secret=alternate_secret) as sv:
             # Double-check the change outputs are right. This is slow, but critical because
@@ -2859,10 +2922,18 @@ class psbtObject(psbtProxy):
                         # their key's position in the script.
                         import vault_signing
                         try:
+                            # section 1.5: the S_v branch selector comes
+                            # from the gate's approval record (what was
+                            # approved), falling back to nSequence
+                            rec = getattr(self, 'vault_approval', None)
+                            sel = None
+                            if isinstance(rec, dict) and \
+                                    inp.is_vault == 'sv':
+                                sel = rec.get('selector')
                             wit.scriptWitness.stack = vault_signing.build_witness(
                                 inp.is_vault, inp.vault_script,
                                 self.vault_sigs_by_pk(inp),
-                                vault_seq.get(in_idx))
+                                vault_seq.get(in_idx), selector=sel)
                         except vault_signing.VaultViolation as e:
                             raise FatalPSBTIssue('vault witness: %s' % e)
                     elif inp.is_multisig:

@@ -155,10 +155,14 @@ def build_psbt(tx_bytes, num_outputs, input_maps):
         r += b'\x00'
     return r
 
-def vault_psbt(wscript, spk, utxo_val, seq, outs, part_sigs=None):
+def vault_psbt(wscript, spk, utxo_val, seq, outs, part_sigs=None,
+               k2=None, k2_xfp=None):
     # 1-in/1-out spend of a freshly funded P2WSH coin; includes BOTH the
     # full (non-witness) UTXO and the witness utxo, the witness script,
-    # and bip32 derivs: K1 external, K2 = device at m/123, K3 external
+    # and bip32 derivs: K1 external, K2 = device at m/123, K3 external.
+    # k2/k2_xfp let T11 swap in the CCC temporary-seed key.
+    if k2 is None:
+        k2, k2_xfp = K2, MY_XFP
     fund = build_tx([(b'\x00' * 32, 0)], [0xffffffff], [(spk, utxo_val)], version=1)
     fund_id = bytes(ngu.hash.sha256d(fund))
     tx = build_tx([(fund_id, 0)], [seq], outs)
@@ -169,7 +173,7 @@ def vault_psbt(wscript, spk, utxo_val, seq, outs, part_sigs=None):
         m += kv(b'\x02' + pk, sig)               # PSBT_IN_PARTIAL_SIG
     m += kv(b'\x05', wscript)                    # PSBT_IN_WITNESS_SCRIPT
     m += kv(b'\x06' + K1, struct.pack('<I', 0x11111111))
-    m += kv(b'\x06' + K2, struct.pack('<II', MY_XFP, 123))
+    m += kv(b'\x06' + k2, struct.pack('<II', k2_xfp, 123))
     m += kv(b'\x06' + K3, struct.pack('<I', 0x33333333))
     m += b'\x00'
     return build_psbt(tx, len(outs), [m])
@@ -234,7 +238,7 @@ except Exception as e:
 
 print('=== T2: gate approves; device signs K2; ONE sig is not 2-of-3 complete')
 try:
-    appr, msg = vault.VaultMode.could_sign(parse(blob))
+    appr, msg = vault.VaultMode.could_sign(p)
     ok('T2: gate approves emergency', appr and 'emergency' in msg)
     p.sign_it()
     inp = p.inputs[0]
@@ -263,7 +267,7 @@ try:
     blob3 = vault_psbt(S_V, SPK_V, 10500, EMG_SEQ, EMG_OUT,
                        part_sigs=[(K1, sig_k1)])
     p = prep(blob3)
-    appr, msg = vault.VaultMode.could_sign(parse(blob3))
+    appr, msg = vault.VaultMode.could_sign(p)
     ok('T3: gate approves (K1 partial verifies)', appr and 'emergency' in msg)
     p.sign_it()
     ok('T3: complete after device signs', p.is_complete())
@@ -287,7 +291,7 @@ try:
     blob4 = vault_psbt(S_V, SPK_V, 10500, N, LADDER_OUT,
                        part_sigs=[(K1, sig_k1)])
     p = prep(blob4)
-    appr, msg = vault.VaultMode.could_sign(parse(blob4))
+    appr, msg = vault.VaultMode.could_sign(p)
     ok('T4: gate approves ladder', appr and 'ladder' in msg)
     p.sign_it()
     txid, stack = final_witness(p)
@@ -312,7 +316,7 @@ try:
     ok('T5: input classified as vault se', inp.is_vault == 'se')
     ok('T5: device key (K2) still required', inp.required_key == {K2})
     ok('T5: not fully signed', not inp.fully_signed)
-    appr, msg = vault.VaultMode.could_sign(parse(blob5))
+    appr, msg = vault.VaultMode.could_sign(p)
     ok('T5: gate approves exit ceremony', appr and 'exit' in msg)
     p.sign_it()
     ok('T5: complete after device co-signs', p.is_complete())
@@ -405,6 +409,112 @@ try:
     ok('T9: ANYONECANPAY partial refused by gate', not appr and 'SIGHASH' in msg)
 except Exception as e:
     ok('T9: gate refusals', False)
+    print('      %s: %s' % (type(e).__name__, e))
+
+print('=== T10: approval-record binding (plan 1.5) - gate must precede signing')
+try:
+    # (a) skipped gate => sign_it refuses even a policy-valid PSBT
+    p = prep(vault_psbt(S_V, SPK_V, 10500, EMG_SEQ, EMG_OUT))
+    try:
+        p.sign_it()
+        ok('T10: sign_it without gate approval refused', False)
+    except Exception as e:
+        ok('T10: sign_it without gate approval refused',
+           'no policy approval record' in str(e))
+
+    # (b) tampered record => refusal (record/tx divergence)
+    p = prep(vault_psbt(S_V, SPK_V, 10500, EMG_SEQ, EMG_OUT))
+    appr, msg = vault.VaultMode.could_sign(p)
+    ok('T10: gate approves + leaves record', appr and
+       isinstance(getattr(p, 'vault_approval', None), dict))
+    p.vault_approval['selector'] = 1      # claim ladder on an emergency tx
+    try:
+        p.sign_it()
+        ok('T10: tampered branch selector refused', False)
+    except Exception as e:
+        ok('T10: tampered branch selector refused', 'branch selector' in str(e))
+
+    # (c) gate + sign_it on the SAME object (the real auth.py flow)
+    p = prep(vault_psbt(S_V, SPK_V, 10500, EMG_SEQ, EMG_OUT))
+    appr, msg = vault.VaultMode.could_sign(p)
+    p.sign_it()
+    ok('T10: gate + sign_it on same object works',
+       list(p.inputs[0].added_sigs.keys()) == [K2])
+
+    # (d) foreign record: gate one PSBT, smuggle the record onto another
+    pA = prep(vault_psbt(S_V, SPK_V, 10500, EMG_SEQ, EMG_OUT))
+    vault.VaultMode.could_sign(pA)
+    pB = prep(vault_psbt(S_V, SPK_V, 10600, EMG_SEQ, EMG_OUT))
+    pB.vault_approval = pA.vault_approval
+    try:
+        pB.sign_it()
+        ok('T10: foreign approval record refused', False)
+    except Exception as e:
+        ok('T10: foreign approval record refused',
+           'differs from the approved' in str(e))
+except Exception as e:
+    ok('T10: approval-record binding', False)
+    print('      %s: %s' % (type(e).__name__, e))
+
+print('=== T11: CCC tmp-seed key path - alternate secret co-signs (plan 1.6)')
+try:
+    # a second seed plays the CCC temporary seed; its m/123 key is the
+    # co-signer key in a second enrolled S_v script. In a real CCC
+    # session the device is logged into the temporary seed, so
+    # settings['xfp'] IS the tmp xfp (capture_xpub at login) and the
+    # PSBT parser marks the tmp key as ours. The key is then found by
+    # PUBKEY MATCH (not xfp/wallet lookup) and sign_it signs with
+    # whichever secret owns the matched pubkey (alternate_secret).
+    words2 = ('legal winner thank year wave sausage worth useful '
+              'legal winner thank yellow')
+    seed2 = bip39.a2b_words(words2.split())
+    alt_raw = bytes([0x80]) + seed2 + bytes(72 - 1 - len(seed2))
+    with stash.SensitiveValues(secret=alt_raw) as asv:
+        K2_ALT = bytes(asv.derive_path('m/123').pubkey())
+        ALT_XFP = asv.get_xfp()
+
+    S_V_ALT = (bytes([vp.OP_IF]) +
+               bytes([2, N & 0xff, (N >> 8) & 0xff]) +
+               bytes([vp.OP_CSV, vp.OP_DROP, vp.OP_ELSE, vp.OP_ENDIF, 0x52]) +
+               push(K1) + push(K2_ALT) + push(K3) +
+               bytes([0x53, vp.OP_CMS]))
+    SPK_V_ALT = vp.p2wsh_spk(S_V_ALT)
+    try:
+        # enroll the CCC-keyed script (k1/spk_e/exit unchanged) and
+        # switch the device to the tmp-seed xfp, as a CCC session would
+        vault.save_cfg(dict(CFG, sv_hash=b2h(SPK_V_ALT), enabled=1))
+        s.put('xfp', ALT_XFP)
+        blob11 = vault_psbt(S_V_ALT, SPK_V_ALT, 10500, EMG_SEQ, EMG_OUT,
+                            k2=K2_ALT, k2_xfp=ALT_XFP)
+        p = parse(blob11)
+        for idx, txin in p.input_iter():
+            p.inputs[idx].validate(idx, txin, p.my_xfp, p)
+        p.consider_keys()
+        p.consider_inputs(cosign_xfp=None)   # my_xfp already covers CCC key
+        p.consider_outputs()
+        p.consider_dangerous_sighash()
+        inp = p.inputs[0]
+        ok('T11: CCC-keyed vault input classified', inp.is_vault == 'sv')
+        ok('T11: CCC tmp key required (pubkey match, foreign xfp)',
+           inp.required_key == {K2_ALT})
+        appr, msg = vault.VaultMode.could_sign(p)
+        ok('T11: gate approves emergency under CCC script',
+           appr and 'emergency' in msg)
+        p.sign_it(alternate_secret=alt_raw)
+        ok('T11: CCC key added its signature',
+           list(inp.added_sigs.keys()) == [K2_ALT])
+        try:
+            r_, s_, sh_ = vsig.parse_der_sig(inp.added_sigs[K2_ALT])
+            good = (sh_ == 1) and \
+                vsig.secp256k1_verify(K2_ALT, r_, s_, digest_of(p))
+        except vsig.VaultViolation:
+            good = False
+        ok('T11: CCC signature is strict DER + verifies', good)
+    finally:
+        vault.save_cfg(dict(CFG, enabled=1))     # restore main enrollment
+        s.put('xfp', MY_XFP)                     # restore device identity
+except Exception as e:
+    ok('T11: CCC tmp-seed key path', False)
     print('      %s: %s' % (type(e).__name__, e))
 
 # ---- cleanup ---------------------------------------------------------------

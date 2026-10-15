@@ -268,6 +268,47 @@ def _verify_vault_partials(cfg, psbt, view):
         vs.verify_input_sigs(psbt, idx, inp, txi, inp.get(ws))
 
 
+def _approval_record(cfg, psbt, view, desc):
+    # Plan section 1.5: in-memory record of exactly what the policy gate
+    # approved. psbtObject.sign_it() refuses (fail-closed) to sign a vault
+    # input unless this record is present and still matches the tx facts,
+    # closing the semantic gap between "what the gate saw" and "what the
+    # signer signs" (the PSRAM re-hash already pins the raw bytes; this
+    # pins the policy decision).
+    pol = VaultPolicy(cfg)
+    kinds = []
+    for i in view['inputs']:
+        spk = bytes(i['spk'])
+        kinds.append('sv' if spk == pol.spk_v else
+                     ('se' if spk == pol.spk_e else None))
+    # branch selector for ladder scripts: derived from the APPROVED class,
+    # never from PSBT metadata - the device constructs what it approved
+    selector = None
+    if any(k == 'sv' for k in kinds):
+        selector = 1 if desc.startswith('ladder') else 0
+    outpoints = None
+    try:
+        outpoints = [(txi.prevout.hash, txi.prevout.n)
+                     for _, txi in psbt.input_iter()]
+    except Exception:
+        pass          # host-test fakes without input_iter
+    try:
+        out_spks = [bytes(o['spk']) for o in view['outputs']]
+        fee = (sum(i['value'] for i in view['inputs']) -
+               sum(o['value'] for o in view['outputs']))
+    except Exception:
+        out_spks, fee = None, None
+    return {
+        'class': desc,
+        'kinds': kinds,
+        'selector': selector,
+        'outpoints': outpoints,
+        'out_spks': out_spks,
+        'fee': fee,
+        'sighashes': [i.get('sighash_type') or 1 for i in view['inputs']],
+    }
+
+
 def vault_log(msg, logfile=VAULT_LOG):
     # Append-only ledger on internal flash. Never raises: logging must not be
     # able to break signing; a refusal is still surfaced via UX.
@@ -495,7 +536,19 @@ class VaultMode:
         if not appr:
             vault_log('REFUSE %s' % msg)
             return False, msg
-        vault_log('APPR %s' % msg)
+        # section 1.5: leave the approval record on this object for
+        # sign_it() to bind the signature to (see psbtObject.
+        # _check_vault_approval); without a record, sign_it refuses
+        # vault inputs fail-closed.
+        try:
+            rec = _approval_record(cfg, psbt, view_from_psbt(psbt), msg)
+            psbt.vault_approval = rec
+            vault_log('APPR %s | class=%s sel=%r fee=%r sighash=%r'
+                      % (msg, rec['class'], rec['selector'], rec['fee'],
+                         rec['sighashes']))
+        except Exception as e:
+            # no record => sign_it will refuse vault inputs (fail-closed)
+            vault_log('APPR %s (approval record failed: %s)' % (msg, e))
         return True, msg
 
 # EOF
