@@ -1,7 +1,8 @@
 # SECURITY ADVISORY — vault-cosign-policy branch (audit 2026-10-15)
 
-**Status:** OPEN — fixed on branch `vault-cosign-policy-fixes` (see remediation
-commits); **not yet merged/released.**
+**Status:** RESOLVED — all findings V-01..V-07 fixed and regression-tested on
+branch `vault-cosign-policy-fixes` (head `d32b5869` at time of writing; see
+"Resolution" below). **Not yet merged/released upstream.**
 
 **Affected:** any firmware built from `vault-cosign-policy` @ `89f13b20`
 (merge-base with upstream `Coldcard/firmware` master `f28e1b26`).
@@ -60,3 +61,72 @@ parser alone would *activate* V-03/V-04, so the parser fix and the policy
 hardening (sighash enforcement, K1 signature verification, UTXO provenance)
 must ship together — which is how the `vault-cosign-policy-fixes` branch is
 structured.
+
+## Resolution (2026-10-15, branch `vault-cosign-policy-fixes`)
+
+All seven findings are fixed; every fix is pinned by an assertion-based
+regression suite driven through the REAL firmware signing chain inside the
+simulator (`unix/work/audit_probe.py`, 49/49), plus host-side and
+Core-regtest oracles.
+
+| ID | Fixed by | What changed |
+|----|----------|--------------|
+| V-01 | `ffd549e6` | `S_v`/`S_e` recognized structurally (`shared/vault_signing.py`) before any M/N heuristic; device key selected by **pubkey match**; role-based completion (any 2-of-3 for S_v); witness built to the empirically verified consensus order (`testing/witness_order_check.py`) |
+| V-02 | `ffd549e6` | same recognition path: S_e needs K1 **and** one of {K2, K3} — never a raw sig count |
+| V-03 | `d9500cff` | every partial signature on a vault input is verified (strict DER, low-S) against the BIP-143 digest of the transaction being approved |
+| V-04 | `d9500cff` | vault signatures must be SIGHASH_ALL (new invariant INV-SIGHASH); grafted sighash bytes refuse |
+| V-05 | `d9500cff`, `ffd549e6` | fee-bearing classes require the full (non-witness) UTXO; the witness script must hash to the claimed spk at classification time |
+| V-06 | `0a58683a` | CCC velocity-ratchet skip now uses the strict `is_vault_psbt` predicate (fail-closed), not the refusal-gate relevance sniff |
+| V-07 | `d32b5869` (and `ffd549e6`) | the simulator suites sign through the real chain (`read_psbt → validate → consider_* → gate → sign_it → finalize`); the audit probe is now an assertion-based regression suite; a Bitcoin Core regtest oracle (plus a dependency-free host selfcheck) verifies consensus validity of everything the device signs |
+
+Additional hardening landed during remediation (not in the original audit):
+
+- **Approval-record binding** (`471d7a07`): the policy gate leaves an
+  in-memory record of exactly what it approved (class, per-input kinds,
+  selector, outpoints, output spks, fee, sighashes); `sign_it()` refuses
+  vault inputs unless the record is present and still matches — closing
+  the gate-to-signer semantic gap (TOCTOU on the decision, not just the
+  bytes).
+- **CCC tmp-seed path** (`471d7a07`): the device co-signs with whichever
+  secret owns the matched pubkey, so real CCC sessions work.
+- **Prevout-vout reads** (`f4feb763`): all vault-side UTXO reads use
+  `txin.prevout.n`, never the input position — found by the Core oracle
+  (a vault coin funded at vout ≠ input index was previously misread as a
+  sibling output: relevance missed it, the gate was skipped, and sign_it
+  refused with no approval record).
+- **assert → raise conversions** (`0a58683a`): five `assert`s on the
+  signing path are now `FatalPSBTIssue` raises, so they fail closed even
+  in builds with asserts compiled out.
+- **Enrollment auditing** (`0a58683a`): `save_cfg` stamps
+  `enrolled_ts`, logs the policy hashes, and the on-device 'Show Policy'
+  viewer displays sv_hash / spk_e / exit_spk with the enrollment time.
+- **`vault_impl_version`** (this release): the cfg records which signing
+  implementation produced each ledger entry (current: 2).
+
+### Guidance for in-flight users
+
+Anyone who funded a vault on `vault-cosign-policy` @ `89f13b20`: **wait for
+the fixed firmware** rather than break-glass. The on-chain scripts
+(`S_v`/`S_e`) are unchanged — the fix is entirely device-side — so the
+fixed firmware can co-sign existing vault coins under policy, including
+their CSV discipline. The break-glass paths in "Recovery" above remain
+available but bypass all device-side policy.
+
+### Test evidence (release build)
+
+Full battery on the remediation branch:
+
+```
+testing/test_vault.py            89/89
+testing/test_vault_hardening.py  43/43
+testing/witness_order_check.py    6/6   (minimal interpreter, real ECDSA)
+unix/vault_sign_sim.py           45/45  (real signing path in simulator)
+unix/vault_sim_e2e.py            25/25  (enroll/lattice/gate e2e)
+unix/work/audit_probe.py         49/49  (V-01..V-07 regression suite)
+unix/vault_core_oracle.py        PASS   (host selfcheck; regtest when
+                                          bitcoind available)
+```
+
+The audit probe doubles as the post-release evidence: re-run
+`unix/work/audit_probe.py` against any release build and attach the
+output to the release notes.

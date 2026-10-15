@@ -25,6 +25,17 @@ except ImportError:
 
 VAULT_LOG = 'vault.log'
 
+# Implementation version of the vault SIGNING path (Phase 5 of the
+# remediation plan), stamped into the cfg at every save and into every
+# approval ledger line, so vault.log records which implementation
+# produced each entry:
+#   1 = pre-remediation: stock M/N heuristics (V-01/V-02 misparses)
+#   2 = remediated: vault_signing recognition + role-based completion +
+#       policy-gate approval record bound to the signature (plan 1.x),
+#       strict-DER/low-S/SIGHASH_ALL partial-sig verification (V-03/V-04),
+#       full-UTXO requirement (V-05), strict ccc ratchet predicate (V-06)
+VAULT_IMPL_VERSION = 2
+
 
 def _cfg():
     # Always returns a dict: a corrupt (non-dict) stored value must not
@@ -428,6 +439,7 @@ def save_cfg(cfg):
     #   policy hashes so the enrollment is auditable in vault.log and
     #   displayable in the policy viewer.
     cfg = dict(cfg)
+    cfg['vault_impl_version'] = VAULT_IMPL_VERSION
     if not cfg.get('enrolled_ts'):
         try:
             import utime
@@ -647,9 +659,9 @@ class VaultMode:
         try:
             rec = _approval_record(cfg, psbt, view_from_psbt(psbt), msg)
             psbt.vault_approval = rec
-            vault_log('APPR %s | class=%s sel=%r fee=%r sighash=%r'
-                      % (msg, rec['class'], rec['selector'], rec['fee'],
-                         rec['sighashes']))
+            vault_log('APPR impl=v%d | %s | class=%s sel=%r fee=%r sighash=%r'
+                      % (VAULT_IMPL_VERSION, msg, rec['class'],
+                         rec['selector'], rec['fee'], rec['sighashes']))
         except Exception as e:
             # no record => sign_it will refuse vault inputs (fail-closed)
             vault_log('APPR %s (approval record failed: %s)' % (msg, e))

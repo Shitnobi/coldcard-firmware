@@ -403,3 +403,58 @@ manifest cross-check):**
   Q5 vault.log growth -> accepted platform pattern. All 12 review
   issues are now closed; the living record for unchosen design paths is
   this ledger (sessions g/h).
+
+## Session 2026-10-15 (i) — audit remediation: V-01..V-07 fixed, tested, released on-branch
+
+Full-security audit of the vault-cosign-policy work (see
+`docs/vault_audit_advisory.md`, findings V-01..V-07) and the complete
+remediation program (`/home/shinobi/AI-Trident/vault-remediation-plan.md`)
+landed on `vault-cosign-policy-fixes`. Commits, in order:
+
+- `1c62a2f3` Phase 0 — the security advisory (do-not-fund notice).
+- `d9500cff` Phase 2 — policy hardening FIRST (V-03 sig verification,
+  V-04 INV-SIGHASH, V-05 full-UTXO requirement), so the tree is never
+  in a state where vault signing works without the hardening.
+- `ffd549e6` Phase 1 — the real signing path: `vault_signing.recognize`
+  classifies S_v/S_e before any M/N heuristic, role-based completion,
+  pubkey-match key selection, consensus-verified witness construction
+  (`testing/witness_order_check.py`: minimal Bitcoin script interpreter
+  with real ECDSA, 6/6 — S_v selector LAST, S_e K1 sig TOPMOST).
+- `471d7a07` Phase 1 §1.5/§1.6 — the approval record (gate-to-signer
+  binding: class, kinds, selector, outpoints, out_spks, fee, sighashes)
+  checked fail-closed in `sign_it`; the CCC tmp-seed key path.
+- `0a58683a` Phase 3 — V-06 strict `is_vault_psbt` predicate for the
+  ccc velocity-ratchet skip; relevance surfacing/logging; five
+  assert→`FatalPSBTIssue` conversions; `enrolled_ts` stamping and the
+  'Show Policy' viewer.
+- `f4feb763` — prevout-vout fix (found by the Core oracle): all vault
+  UTXO reads use `txin.prevout.n`, never the input position.
+- `d32b5869` Phase 4 — `unix/work/audit_probe.py` rewritten as the
+  assertion-based V-01..V-07 regression suite (49/49) incl. a 200-case
+  mutation fuzz (never signs without gate approval); the Core oracle
+  (`unix/vault_core_oracle.py` + `unix/vault_core_sign.py`).
+
+### New invariants (device-side; the on-chain script enforces only
+### CSV/branch structure — the threat model assumes the HOST and the
+### PSBT are adversarial)
+
+- **INV-SIGHASH**: every signature in a vault witness (the device's and
+  every partial it inherits) is strict-DER, low-S, SIGHASH_ALL, and
+  verifies against the BIP-143 digest of the approved transaction.
+  Vault signatures can never be grafted onto another transaction.
+- **INV-UTXO**: fee-bearing policy classes (P1/P3) are judged only
+  against txid-cross-checked full UTXOs; a witness script that does not
+  hash to the claimed spk refuses at classification.
+- **INV-BINDING**: `sign_it` refuses vault inputs unless the policy
+  gate left an approval record on this exact object and every recorded
+  fact (outpoints, outputs, fee, sighashes, selector) still matches.
+- **INV-RATCHET**: the CCC velocity-ratchet skip requires the strict
+  `is_vault_psbt` predicate (every input verifiable + structural vault
+  match); any doubt => the ratchet applies.
+
+### Ledger
+
+`vault.log` entries now record the implementation version
+(`vault_impl_version`, currently 2) that produced them, plus the
+enrollment timestamp and policy hashes at save time. The cfg schema is
+otherwise unchanged — no migration for enrolled policies.
