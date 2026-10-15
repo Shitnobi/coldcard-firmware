@@ -5,21 +5,25 @@
 # section 4.2), host-side.
 #
 # The class-3 killer: any transaction the vault policy approves must also
-# be CONSENSUS-valid. Two modes:
+# be CONSENSUS-valid. Two modes, each covering BOTH spend classes:
 #
 #  1. selfcheck (always runs, no bitcoind needed): funds the enrolled
 #     S_v scriptPubKey with a synthetic funding transaction, asks the
 #     simulator (unix/vault_core_sign.py, through the full real firmware
-#     signing chain) to co-sign the emergency spend, then independently
-#     verifies the result host-side: tx structure, prevout binding,
-#     nSequence/nLockTime policy shape, witness stack order, script
+#     signing chain) to co-sign the P1 emergency spend AND the P2 CSV
+#     ladder spend, then independently verifies the results host-side:
+#     tx structure, prevout binding, nSequence/nLockTime policy shape,
+#     witness stack order (incl. the S_v branch selector), script
 #     hash, and BOTH signatures against a host-computed BIP-143 digest
 #     (python-ecdsa). Found the vout-vs-input-index bug this way.
 #
 #  2. regtest (when bitcoind is on PATH): same flow but the funding is a
 #     REAL coin on a private regtest chain, and the signed tx must be
 #     accepted by `testmempoolaccept` and mined. This is Bitcoin Core
-#     itself as the oracle - no reimplementation trust.
+#     itself as the oracle - no reimplementation trust. The ladder
+#     round additionally proves the cadence is enforced by CONSENSUS:
+#     the CSV spend is refused pre-maturity and accepted only after
+#     the deposit has N confirmations (BIP-68).
 #
 # Run from the repo root:  python3 unix/vault_core_oracle.py
 # Exits non-zero on any failure.
@@ -108,8 +112,13 @@ def parse_signed(signed):
                 out_val=out_val, out_spk=out_spk, stack=stack, lock=lock)
 
 
-def verify_signed(signed, ctx, funding_txid_le, vout, amount, tag):
-    # independent host-side consensus verification of the sim's output
+def verify_signed(signed, ctx, funding_txid_le, vout, amount, tag,
+                  spend='emergency', dest_spk=None):
+    # independent host-side consensus verification of the sim's output.
+    # spend='emergency': P1 shape (nSequence 0xFFFFFFFD, out pinned to
+    #   spk_e, empty OP_IF selector -> ELSE branch).
+    # spend='ladder' (G-1): P2 shape (nSequence == ctx n, height-form
+    #   CSV, out to dest_spk, 0x01 selector -> OP_IF/CSV branch).
     import ecdsa
     from ecdsa.util import sigdecode_der
 
@@ -117,6 +126,16 @@ def verify_signed(signed, ctx, funding_txid_le, vout, amount, tag):
     K1 = bytes.fromhex(ctx['k1_pubkey'])
     K2 = bytes.fromhex(ctx['k2_pubkey'])
     t = parse_signed(signed)
+
+    if spend == 'ladder':
+        assert dest_spk is not None, 'ladder verify needs dest_spk'
+        seq_want = int(ctx['n'])
+        sel_want = b'\x01'                  # TRUE -> OP_IF (CSV branch)
+        out_want = bytes(dest_spk)
+    else:
+        seq_want = 0xFFFFFFFD
+        sel_want = b''                      # empty -> OP_ELSE (no CSV)
+        out_want = bytes.fromhex(ctx['spk_e'])
 
     ok = True
 
@@ -127,15 +146,18 @@ def verify_signed(signed, ctx, funding_txid_le, vout, amount, tag):
 
     check('prevout binds the funded coin',
           t['prev_hash'] == funding_txid_le and t['prev_n'] == vout)
-    check('nSequence == 0xFFFFFFFD (emergency)', t['seq'] == 0xFFFFFFFD)
+    check('nSequence == %s (%s)' % (hex(seq_want), spend),
+          t['seq'] == seq_want)
     check('nLockTime == 0', t['lock'] == 0)
-    check('single output is the pinned spk_e',
-          t['out_spk'] == bytes.fromhex(ctx['spk_e']))
+    check('single output is the expected destination',
+          t['out_spk'] == out_want)
     check('output value = amount - fee',
           t['out_val'] == amount - FEE)
     check('witness = [dummy, sig, sig, selector, script]',
           len(t['stack']) == 5 and t['stack'][0] == b'' and
-          t['stack'][3] == b'')
+          t['stack'][3] == sel_want)
+    check('branch selector is the %s branch' % spend,
+          t['stack'][3] == sel_want)
     check('witness script is the enrolled S_v', t['stack'][4] == S_V)
     check('sha256(S_v) == spk_v[2:]',
           hashlib.sha256(S_V).digest() ==
@@ -181,7 +203,29 @@ def selfcheck():
     resp = json.load(open(RESP))
     signed = bytes.fromhex(resp['signed_hex'])
     print('  sim signed: %s (%s)' % (resp['txid'], resp['class']))
-    return verify_signed(signed, ctx, txid_le, 1, AMOUNT, 'selfcheck')
+    ok = verify_signed(signed, ctx, txid_le, 1, AMOUNT, 'selfcheck')
+
+    # G-1: ladder (P2 CSV) round on a second synthetic coin - same full
+    # sim chain, host-verified against the ladder consensus shape
+    # (nSequence == N height form, TRUE selector -> OP_IF/CSV branch,
+    # withdrawal destination). The BIP-68 maturity itself needs a chain
+    # and is exercised by the regtest mode below.
+    fund2 = build_tx([(b'\x11' * 32, 0)], [0xffffffff],
+                     [(bytes([0x00, 0x14]) + b'\xab' * 20, AMOUNT),
+                      (spk_v, AMOUNT)], version=1)
+    txid2_le = dsha(fund2)
+    dest = bytes([0x00, 0x14]) + b'\xcd' * 20      # plain P2WPKH dest
+    json.dump({'txid': txid2_le[::-1].hex(), 'vout': 1,
+               'amount_sat': AMOUNT, 'funding_hex': fund2.hex(),
+               'spend': 'ladder', 'dest_spk': dest.hex()},
+              open(REQ, 'w'))
+    run_sim()                                   # sign (ladder)
+    resp = json.load(open(RESP))
+    signed = bytes.fromhex(resp['signed_hex'])
+    print('  sim signed ladder: %s (%s)' % (resp['txid'], resp['class']))
+    ok = verify_signed(signed, ctx, txid2_le, 1, AMOUNT, 'selfcheck-ladder',
+                       spend='ladder', dest_spk=dest) and ok
+    return ok
 
 
 def which(prog):
@@ -205,7 +249,19 @@ def regtest():
                '-rpcport=%d' % port]
         if wallet:
             cmd += ['-rpcwallet=' + wallet]
-        cmd += list(args)
+        # H-1 fix (framework audit): subprocess wants strings, but callers
+        # pass Python bools/None for the optional RPC params - a raw bool is
+        # a TypeError and str(False) == 'False' is not JSON. Map to the
+        # JSON literals bitcoin-cli parses ('true'/'false'/'null').
+        conv = []
+        for a in args:
+            if isinstance(a, bool):
+                conv.append('true' if a else 'false')
+            elif a is None:
+                conv.append('null')
+            else:
+                conv.append(str(a))
+        cmd += conv
         r = subprocess.run(cmd, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=120)
         out = r.stdout.decode().strip()
@@ -244,8 +300,10 @@ def regtest():
         spk_v = bytes.fromhex(ctx['spk_v'])
         vaddr = bech32.encode('bcrt', 0, spk_v[2:])
 
-        txid = cli('sendtoaddress', vaddr, '0.00100000', '', '', False,
-                   False, None, None, False, wallet='ora')
+        # H-2 fix (framework audit): the 9-arg positional form with null
+        # optionals is rejected by Core 28 ('Invalid estimate_mode'); every
+        # omitted arg was a default anyway, so send the minimal form.
+        txid = cli('sendtoaddress', vaddr, '0.00100000', wallet='ora')
         funding_hex = json.loads(
             cli('gettransaction', txid, wallet='ora'))['hex']
         dec = json.loads(cli('decoderawtransaction', funding_hex))
@@ -263,7 +321,10 @@ def regtest():
         ok = verify_signed(bytes.fromhex(signed), ctx,
                            bytes.fromhex(txid)[::-1], vout, AMOUNT, 'regtest')
 
-        res = json.loads(cli('testmempoolaccept', "['%s']" % signed))
+        # H-3 fix (framework audit): modern bitcoin-cli only accepts
+        # double-quoted JSON for array params; the legacy shell-style
+        # "['hex']" form is a parse error.
+        res = json.loads(cli('testmempoolaccept', '["%s"]' % signed))
         acc = res[0].get('allowed')
         print('  [regtest] testmempoolaccept allowed: %s' % acc)
         ok = ok and acc
@@ -272,6 +333,60 @@ def regtest():
             cli('generatetoaddress', '1', addr, wallet='ora')
             mem = json.loads(cli('getmempoolinfo'))['size']
             print('  [regtest] mined (mempool size %d)' % mem)
+            ok = ok and mem == 0
+
+        # ---- G-1: CSV ladder spend of a second deposit -----------------
+        # The emergency coin is spent; deposit a fresh coin to the same
+        # enrolled S_v address, co-sign the P2 ladder withdrawal, and let
+        # Bitcoin Core itself enforce the cadence: the spend must be
+        # refused pre-maturity (BIP-68 relative locktime) and accepted
+        # only once the deposit has N confirmations.
+        txid2 = cli('sendtoaddress', vaddr, '0.00100000', wallet='ora')
+        funding2_hex = json.loads(
+            cli('gettransaction', txid2, wallet='ora'))['hex']
+        dec2 = json.loads(cli('decoderawtransaction', funding2_hex))
+        vout2 = next(i for i, o in enumerate(dec2['vout'])
+                     if o['scriptPubKey']['hex'] == ctx['spk_v'])
+        cli('generatetoaddress', '1', addr, wallet='ora')  # confirm deposit
+        print('  ladder deposit txid=%s vout=%d' % (txid2, vout2))
+
+        # withdrawal destination: a fresh bech32 wallet address (plain
+        # P2WPKH - the canonical 'withdrawal' ladder shape)
+        waddr = cli('getnewaddress', '', 'bech32', wallet='ora')
+        _ver, prog = bech32.decode('bcrt', waddr)
+        dest_spk = bytes([_ver, len(prog)]) + bytes(prog)
+
+        json.dump({'txid': txid2, 'vout': vout2, 'amount_sat': AMOUNT,
+                   'funding_hex': funding2_hex, 'spend': 'ladder',
+                   'dest_spk': dest_spk.hex()}, open(REQ, 'w'))
+        run_sim()
+        resp = json.load(open(RESP))
+        signed2 = resp['signed_hex']
+        print('  sim signed ladder: %s (%s)' % (resp['txid'], resp['class']))
+        ok = verify_signed(bytes.fromhex(signed2), ctx,
+                           bytes.fromhex(txid2)[::-1], vout2, AMOUNT,
+                           'regtest-ladder', spend='ladder',
+                           dest_spk=dest_spk) and ok
+
+        # pre-maturity: BIP-68 must refuse the spend outright
+        res = json.loads(cli('testmempoolaccept', '["%s"]' % signed2))
+        pre_ok = res[0].get('allowed') is False
+        why = res[0].get('reject-reason') or res[0].get('reject_reason')
+        print('  [regtest] ladder pre-maturity refused: %s (%s)' %
+              (pre_ok, why))
+        ok = ok and pre_ok
+
+        # mature the coin (N confirmations), then the spend must pass
+        cli('generatetoaddress', str(ctx['n']), addr, wallet='ora')
+        res = json.loads(cli('testmempoolaccept', '["%s"]' % signed2))
+        acc2 = res[0].get('allowed')
+        print('  [regtest] ladder post-maturity allowed: %s' % acc2)
+        ok = ok and acc2
+        if acc2:
+            cli('sendrawtransaction', signed2)
+            cli('generatetoaddress', '1', addr, wallet='ora')
+            mem = json.loads(cli('getmempoolinfo'))['size']
+            print('  [regtest] ladder mined (mempool size %d)' % mem)
             ok = ok and mem == 0
         return ok
     finally:

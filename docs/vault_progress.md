@@ -566,3 +566,50 @@ re-enrollment fund-lock (fail-closed, break-glass recoverable),
 `input_iter` CTxIn reuse (audited safe at every call site), lattice
 leaf commitment-only enrollment, OP_RETURN dust exemption (matches
 Core).
+
+## (l) Core-oracle framework fixes + G-1: CSV ladder accepted by Bitcoin Core
+
+Session 2026-10-15 (cont). A full e2e deposit simulation (session (k)
+follow-up) exposed three bugs in the regtest half of the on-chain
+validity oracle — all dead code until now, because regtest mode had
+never actually run (no bitcoind in the dev environment, so it silently
+skipped):
+
+- **H-1** `vault_core_oracle.cli()` passed Python `bool`/`None` args
+  straight to `subprocess` → `TypeError` the moment regtest mode runs.
+- **H-2** even with stringified args, the 9-arg positional
+  `sendtoaddress` form is rejected by Core 28 (`Invalid estimate_mode`
+  on the null optionals); every omitted arg was a default anyway.
+- **H-3** `testmempoolaccept` used legacy shell-style single-quoted
+  JSON (`"['hex']"`), a parse error on modern bitcoin-cli.
+
+Fixes: JSON-literal arg conversion in `cli()` (bool → `true`/`false`,
+`None` → `null`), minimal `sendtoaddress` form, double-quoted JSON
+array for `testmempoolaccept`. Red-first evidence: all three failures
+were reproduced on the unpatched tree (tracebacks + `-8`/parse errors)
+before patching; firmware untouched.
+
+**G-1 closed** — the Core oracle now covers the P2 CSV ladder, not
+just P1 emergency:
+
+- `unix/vault_core_sign.py`: request field `spend` selects the class
+  ('emergency' default; 'ladder' builds nSequence == N height-form,
+  nVersion 2 per BIP-68/112, output to request `dest_spk`).
+- `unix/vault_core_oracle.py`: `verify_signed()` parametrized by spend
+  class (expected nSequence, S_v branch selector, destination);
+  selfcheck gains a synthetic ladder round (host-verified consensus
+  shape, no chain needed); regtest deposits a **second real coin** to
+  the enrolled S_v address, has the device co-sign the ladder
+  withdrawal through the full real firmware signing chain, and lets
+  Bitcoin Core enforce the cadence.
+- Verified against Bitcoin Core 28.0 (official binary): emergency
+  spend accepted + mined; ladder spend **refused pre-maturity with
+  `non-BIP68-final`**, **accepted after N=1008 confirmations**,
+  broadcast, mined, mempool drained. The gate message was
+  `ladder: withdrawal (100000 sats spent)` — policy class and
+  consensus verdict agree.
+
+Battery on this tree (spot after the framework patch — no `shared/`
+or firmware files touched): sim_e2e 25/25, sign_sim 45/45, audit3
+23/23, plus the oracle selfcheck (emergency + ladder rounds, 22
+checks) all green.

@@ -15,9 +15,14 @@
 #   - dump:  derive the device vault key (fixed seed) and write
 #            core_oracle_ctx.json (K2 pubkey, S_v/S_e scriptPubKeys)
 #   - sign:  read the request (real funding txid/vout/amount + raw
-#            funding tx), build the P1 emergency PSBT against that REAL
-#            outpoint, run the real signing chain, write
-#            core_oracle_response.json (signed raw tx hex)
+#            funding tx), build the requested spend PSBT against that
+#            REAL outpoint, run the real signing chain, write
+#            core_oracle_response.json (signed raw tx hex).
+#            Request field 'spend' selects the class (G-1 coverage):
+#              'emergency' (default): P1 sink spend, nSequence
+#                 0xFFFFFFFD, output pinned to spk_e
+#              'ladder': P2 CSV spend, nSequence == N (height form),
+#                 nVersion 2 (BIP-68/112), output to request 'dest_spk'
 #
 # Run from unix/work:
 #   MICROPYPATH=:../../shared ../coldcard-mpy -X heapsize=9m \
@@ -139,6 +144,11 @@ vout = int(req['vout'])
 amount = int(req['amount_sat'])
 funding_tx = h2b(req['funding_hex'])
 FEE = 300                                  # well inside the f0_max window
+# G-1: which policy class to co-sign. 'ladder' spends via the CSV branch
+# (nSequence == N, nVersion 2) to the request-supplied destination; the
+# default 'emergency' shape is unchanged.
+SPEND = req.get('spend', 'emergency')
+DEST = h2b(req['dest_spk']) if req.get('dest_spk') else None
 
 vault.save_cfg(dict(CFG, enabled=1))
 
@@ -162,9 +172,21 @@ def build_tx(prevouts, seqs, outs, lock_time=0, version=2):
 def kv(key, val):
     return vi(len(key)) + key + vi(len(val)) + val
 
-def emg_psbt(part_sigs=None):
-    tx = build_tx([(prev_hash, vout)], [vp.SEQ_EMERGENCY],
-                  [(SPK_E, amount - FEE)])
+def make_psbt(part_sigs=None):
+    # P1 emergency: nSequence 0xFFFFFFFD (CSV disabled) -> S_v ELSE branch,
+    #              output pinned to the sink spk_e.
+    # P2 ladder (G-1): nSequence == N (height-form CSV) -> S_v IF branch,
+    #              nVersion 2 (BIP-68/112: OP_CSV cannot execute below it),
+    #              output to the request-supplied dest_spk (INV-SINK forbids
+    #              spk_e on non-emergency classes; a plain withdrawal dest
+    #              is the canonical ladder shape).
+    if SPEND == 'ladder':
+        assert DEST is not None, "ladder request needs 'dest_spk'"
+        seq, dest = N, DEST
+    else:
+        seq, dest = vp.SEQ_EMERGENCY, SPK_E
+    tx = build_tx([(prev_hash, vout)], [seq],
+                  [(dest, amount - FEE)])
     m = b''
     m += kv(b'\x00', funding_tx)               # full (non-witness) UTXO
     m += kv(b'\x01', ct_out(SPK_V, amount))    # witness utxo
@@ -194,14 +216,14 @@ def prep(blob):
     return p
 
 # pass 1: digest for the external K1 signature (same object shape, no sigs)
-p0 = prep(emg_psbt())
+p0 = prep(make_psbt())
 idx, txi = list(p0.input_iter())[0]
 inp = p0.inputs[idx]
 digest = p0.make_txn_segwit_sighash(idx, txi, inp.amount, inp.scriptCode, 1)
 sig_k1 = psbtObject.ecdsa_grind_sign(K1_PRIV, digest, 1)
 
 # pass 2: the real signing chain on the SAME object the gate judged
-p = prep(emg_psbt(part_sigs=[(K1, sig_k1)]))
+p = prep(make_psbt(part_sigs=[(K1, sig_k1)]))
 appr, msg = vault.VaultMode.could_sign(p)
 if not appr:
     print('CORE ORACLE FAIL: gate refused: %s' % msg)
