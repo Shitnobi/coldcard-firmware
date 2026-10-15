@@ -48,10 +48,13 @@ def pol(**kw):
     return vp.VaultPolicy(p)
 
 
-def view(seq=N, in_spk=SPK_V, out_spks=((WARM_SPK, 15000),), lock=0, vin=162000, sigs=()):
+def view(seq=N, in_spk=SPK_V, out_spks=((WARM_SPK, 15000),), lock=0, vin=162000, sigs=(),
+         txv=2, utxo_full=True):
     return {
         'lock_time': lock,
-        'inputs': [{'spk': in_spk, 'value': vin, 'sequence': seq, 'part_sigs': list(sigs)}],
+        'tx_version': txv,      # W-01: CSV ladders require nVersion >= 2
+        'inputs': [{'spk': in_spk, 'value': vin, 'sequence': seq,
+                    'part_sigs': list(sigs), 'utxo_full': utxo_full}],
         'outputs': [{'spk': s, 'value': v} for s, v in out_spks],
     }
 
@@ -168,6 +171,12 @@ def test_cfg_structural_validation():
     expect_parse(lambda: pol(exit_spk='0020' + '11' * 31))   # 33 bytes
     expect_parse(lambda: pol(exit_spk='51'))                 # OP_1 bare
 
+    # W-05 (validity audit #2): sv_hash == spk_e re-routes every
+    # emergency to the exit checker, which can never pass - the
+    # emergency path would silently self-lock
+    expect_parse(lambda: pol(spk_e=SPK_V.hex()))
+    expect_parse(lambda: pol(sv_hash=SPK_EH.hex()))
+
     # sv_hash/spk_e are P2WSH scriptPubKeys
     expect_parse(lambda: pol(sv_hash='00'))
     expect_parse(lambda: pol(sv_hash='0011'))
@@ -206,6 +215,41 @@ def test_P3_exit_ceremony():
     # over-fee exit
     expect('overfee', vp1.check, view(seq=vp.SEQ_EMERGENCY, in_spk=SPK_EH,
                                       out_spks=((EXIT_SPK, 154000),), vin=162000, sigs=[K1]))
+
+
+def test_validity_audit2():
+    # Regression coverage for the validity audit #2 findings (W-01..W-05):
+    # the device must never co-sign a transaction Bitcoin would reject.
+    # W-01: BIP-68/112 - OP_CSV cannot execute on nVersion < 2, so CSV
+    # ladders require a version-2 (or higher) transaction
+    expect_ok(pol().check, view(seq=N, txv=2))
+    expect('W-01 v1 ladder', pol().check, view(seq=N, txv=1))
+    expect('W-01 unknown version', pol().check, view(seq=N, txv=None))
+    # emergency/exit take the ELSE branch (no OP_CSV executes) and stay
+    # valid at v1
+    expect_ok(pol().check, view(seq=vp.SEQ_EMERGENCY,
+                                out_spks=((SPK_EH, 160218),), txv=1))
+
+    # W-02: ladders are signature-bearing (BIP-143 digest embeds nValue),
+    # so they need full txid-cross-checked UTXOs like P1/P3
+    expect('W-02 witness-utxo ladder', pol().check,
+           view(seq=N, utxo_full=False))
+
+    # W-03: zero-fee ladders are non-standard (below min relay fee)
+    expect('W-03 zero-fee ladder', pol().check,
+           view(seq=N, out_spks=((WARM_SPK, 162000),), vin=162000))
+
+    # W-04: dust outputs and below-min-relay fees are refused in every
+    # class, so "policy-approved" implies "broadcastable"
+    expect('W-04 dust emergency', pol().check,
+           view(seq=vp.SEQ_EMERGENCY, out_spks=((SPK_EH, 500),),
+                vin=162000))
+    expect('W-04 fee below relay floor', pol().check,
+           view(seq=vp.SEQ_EMERGENCY, out_spks=((SPK_EH, 161999),),
+                vin=162000))
+    # OP_RETURN outputs are exempt from the dust rule (standard at 0)
+    expect_ok(pol().check,
+              view(seq=N, out_spks=((b'\x6a' + b'\x00' * 19, 0),)))
 
 
 def test_lattice_commitment():

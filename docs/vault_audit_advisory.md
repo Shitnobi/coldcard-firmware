@@ -130,3 +130,55 @@ unix/vault_core_oracle.py        PASS   (host selfcheck; regtest when
 The audit probe doubles as the post-release evidence: re-run
 `unix/work/audit_probe.py` against any release build and attach the
 output to the release notes.
+
+---
+
+# VALIDITY AUDIT #2 — consensus-invalid / non-standard signatures (2026-10-15, `master` @ `28ea046d`)
+
+**Status:** RESOLVED — findings W-01..W-05 fixed and regression-tested
+(`vault_impl_version` 3). Full report:
+`/home/shinobi/AI-Trident/vault-validity-audit.md`.
+
+Scope of this round: bugs that let the device sign **consensus-invalid**
+transactions (rejected by the network after co-signing) or
+**non-standard** ones (never relayed), and coverage gaps in the policy
+gate. The audit was a static review of the full signing chain
+(`read_psbt → validate → consider_* → vault gate → sign_it → finalize`)
+plus an empirical probe (`unix/work/audit2_probe.py`).
+
+## Findings
+
+| ID | Class | Finding | Fix |
+|----|-------|---------|-----|
+| W-01 | 3 | CSV ladder spends approved on nVersion=1 transactions — `OP_CSV` (BIP-68/112) fails unconditionally on v1, so the fully-signed tx is consensus-invalid | `_check_ladder` requires `tx_version >= 2`, fail-closed on unknown (`None`); `view_from_psbt` now carries `tx_version` from `psbt.txn_version` |
+| W-02 | 3 | Ladder judged fee-bearing classes against **witness-utxo amounts** — the BIP-143 digest embeds `nValue`, so a spoofed WU amount binds the device signature to the attacker's claimed value | P2 ladders now require full (txid-cross-checked) UTXOs via `_require_full_utxo` (same as P1/P3) |
+| W-03 | 3/design | Ladder fee unbounded in both directions: fee=0 signed (non-standard, never relays) and no ceiling | P2 fee **floor** via `_require_relayable_fee` (1 sat/vByte conservative vsize estimate); ceiling deliberately omitted (post-cadence the 2-of-3 quorum can withdraw everything anyway — pinned by regression B3) |
+| W-04 | 3 | No dust threshold or min-relay floor in P1/P3: a 500-sat dust output and a fee=1 emergency were approved (consensus-valid but non-standard → stuck) | `DUST_LIMIT = 546` on every policy class for all outputs (OP_RETURN exempt); `_require_relayable_fee` in P1 (emergency), P3 (exit), P2 (ladder) |
+| W-05 | 4 | Enrollment accepted `sv_hash == spk_e` — emergency mode then re-routes to the exit checker, which permanently refuses ("must re-enroll to fresh spk_v"), a self-inflicted DoS | `VaultPolicy.__init__` refuses `sv_hash == spk_e`; flows into `validate_cfg` for free |
+| W-06 | design | Ladder allows foreign inputs / arbitrary destinations | **By design**: after the CSV cadence the 2-of-3 quorum can spend unconditionally anyway; pinned by regression B10 |
+
+Minor observations (O-01..O-05, no code change): see the full report.
+
+## Verified solid (negative results)
+
+Duplicate outpoints (stock `consider_inputs` check), `prevout.n` indexing,
+witness ordering (S_v selector topmost under script for the CSV branch),
+INV-SIGHASH, approval-record binding, P1/P3 full-UTXO, ratchet predicate.
+
+## Test evidence
+
+```
+unix/work/audit2_probe.py         22/22  (W-01..W-06 regression; B3/B10 pin
+                                          the design decisions)
+testing/test_vault_policy.py      10/10  (incl. test_validity_audit2)
+testing/test_vault.py             89/89
+testing/test_vault_hardening.py   43/43
+testing/witness_order_check.py    6/6
+unix/vault_sign_sim.py            45/45
+unix/vault_sim_e2e.py             25/25
+unix/work/audit_probe.py          49/49  (V-01..V-07 regression, re-run)
+```
+
+The on-chain scripts are unchanged; the fixes are entirely device-side,
+so enrolled vaults need no migration. The cfg schema is unchanged except
+`vault_impl_version` in ledger entries (2 → 3).

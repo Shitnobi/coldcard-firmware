@@ -99,7 +99,11 @@ class Inp:
 class Out:
     def __init__(s, spk, val): s.scriptPubKey, s.nValue = spk, val
 class P:
-    def __init__(s, ins, outs, lt=0): s.inputs, s.outputs, s.lock_time = ins, outs, lt
+    # txn_version: BIP-68/112 requires nVersion >= 2 for CSV ladders
+    # (W-01, validity audit #2); fakes default to the modern form
+    def __init__(s, ins, outs, lt=0, tv=2):
+        s.inputs, s.outputs, s.lock_time = ins, outs, lt
+        s.txn_version = tv
 
 def enable(cfg): _store['vault'] = cfg
 def p_emg(fee=500, seq=0xfffffffd): return P([Inp(SPK_V, 10_000 + fee, seq)], [Out(SPK_E, 10_000)])
@@ -274,8 +278,9 @@ class RTxIn:
 class ROut:
     def __init__(s, spk, val): s.scriptPubKey, s.nValue = spk, val
 class RPsbt:
-    def __init__(s, ins, outs, lt=0):
+    def __init__(s, ins, outs, lt=0, tv=2):
         s.inputs, s.outputs, s.lock_time = ins, outs, lt
+        s.txn_version = tv          # W-01: CSV ladders need nVersion >= 2
         s._raw = b''
     def input_iter(s):
         for i, n in enumerate(s.inputs): yield i, RTxIn(n._seq)

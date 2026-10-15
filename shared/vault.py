@@ -25,16 +25,18 @@ except ImportError:
 
 VAULT_LOG = 'vault.log'
 
-# Implementation version of the vault SIGNING path (Phase 5 of the
-# remediation plan), stamped into the cfg at every save and into every
-# approval ledger line, so vault.log records which implementation
-# produced each entry:
+# Implementation version of the vault SIGNING path, stamped into the cfg
+# at every save and into every approval ledger line, so vault.log records
+# which implementation produced each entry:
 #   1 = pre-remediation: stock M/N heuristics (V-01/V-02 misparses)
 #   2 = remediated: vault_signing recognition + role-based completion +
 #       policy-gate approval record bound to the signature (plan 1.x),
 #       strict-DER/low-S/SIGHASH_ALL partial-sig verification (V-03/V-04),
 #       full-UTXO requirement (V-05), strict ccc ratchet predicate (V-06)
-VAULT_IMPL_VERSION = 2
+#   3 = validity audit #2 round: ladders require nVersion >= 2 (W-01) and
+#       full UTXOs (W-02); dust/min-relay standardness floors on all
+#       classes (W-03/W-04); sv_hash != spk_e at enrollment (W-05)
+VAULT_IMPL_VERSION = 3
 
 
 def _cfg():
@@ -224,6 +226,11 @@ def view_from_psbt(psbt):
     # VaultViolation whenever a needed fact is uncollectable so the caller
     # refuses instead of approving on partial information.
     view = {'lock_time': getattr(psbt, 'lock_time', 0), 'inputs': [], 'outputs': []}
+    # W-01 (validity audit #2): carry the global tx nVersion so the
+    # policy layer can enforce BIP-68/112's version >= 2 for CSV ladders.
+    # Unknown (host-test fakes without the fact) stays None => the ladder
+    # checker fails closed.
+    view['tx_version'] = getattr(psbt, 'txn_version', None)
     if hasattr(psbt, 'input_iter') and hasattr(psbt, 'output_iter'):
         # real firmware psbtObject: nSequence lives in the unsigned tx
         # (input_iter -> CTxIn), utxos are file proxies, outputs stream

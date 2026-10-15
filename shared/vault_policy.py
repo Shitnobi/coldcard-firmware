@@ -39,6 +39,23 @@ SEQ_VALUE_MASK = 0xFFFF
 
 MAX_CSV_BLOCKS = 0xFFFF             # 16-bit height-form CSV; ~455 days
 
+# W-04 (validity audit #2): standardness floors, so that "policy-approved"
+# implies "broadcastable" under Bitcoin Core's default policy:
+#   - DUST_LIMIT: outputs below the dust threshold (546 sats, the
+#     25/34-byte scriptPubKey threshold; conservative vs. P2WPKH's 294)
+#     are non-standard and will not relay. OP_RETURN outputs are exempt
+#     (zero-value data carriers are standard).
+#   - _min_relay_fee: fee floor for a 1 sat/vByte default relay policy,
+#     computed from a CONSERVATIVE (over-)estimate of the transaction's
+#     virtual size: ~96 B base + ~66 vB per segwit vault input (witness
+#     ~262 B / 4) + ~43 B per output, rounded up generously.
+DUST_LIMIT = 546
+
+
+def _min_relay_fee(view):
+    # minimum fee (sats) for this tx shape to relay at 1 sat/vByte
+    return 100 + 70 * len(view["inputs"]) + 45 * len(view["outputs"])
+
 
 class VaultViolation(Exception):
     pass
@@ -201,6 +218,15 @@ class VaultPolicy:
         # funds in the sink could never leave (fail-closed fund-lock).
         if self.exit_dest and self.exit_dest in (self.spk_v, self.spk_e):
             raise VaultViolation('exit_spk must differ from sv_hash/spk_e')
+        # W-05 (validity audit #2): sv_hash == spk_e makes every S_v
+        # emergency input also "spend the sink", so _classify routes
+        # emergencies to the exit checker, which can never pass (P3 pays
+        # exit_dest, never spk_e) - the emergency path silently self-locks.
+        # The exit_spk pair above already had this check; this pair was
+        # missed. Refuse at enrollment instead of at spend time.
+        if self.spk_v is not None and self.spk_e is not None \
+                and self.spk_v == self.spk_e:
+            raise VaultViolation('sv_hash must differ from spk_e')
 
     def _classify(self, view):
         # view = {lock_time:int, inputs:[{spk,value,sequence,part_sigs}], outputs:[...]}
@@ -248,6 +274,16 @@ class VaultPolicy:
         # shape that would let an attacker back-date pinning.
         if view["lock_time"] != 0:
             raise VaultViolation("vault txs commit nLockTime == 0")
+        # W-04 (validity audit #2): dust outputs are non-standard - the
+        # device must not co-sign a transaction no node will relay. Applies
+        # to every class; OP_RETURN outputs (zero-value data) are exempt.
+        for i, o in enumerate(view["outputs"]):
+            val = o.get("value")
+            if val is None:
+                raise VaultViolation("output %d: missing value" % i)
+            if val < DUST_LIMIT and bytes(o["spk"])[:1] != b"\x6a":
+                raise VaultViolation("output %d: dust (%d sats < %d)"
+                                     % (i, val, DUST_LIMIT))
         if kind == "emergency":
             return self._check_emergency(view)
         if kind == "exit":
@@ -272,6 +308,7 @@ class VaultPolicy:
         fee = view["inputs"][0]["value"] - out["value"]
         if not (0 < fee <= self.f0_max):
             raise VaultViolation("P1: fee out of window")
+        self._require_relayable_fee(view, "P1")
         return "emergency F=%d" % fee
 
     def _require_full_utxo(self, view, tag):
@@ -286,6 +323,17 @@ class VaultPolicy:
                                      "on input %d" % (tag, i))
 
     def _check_ladder(self, view):
+        # W-01 (validity audit #2): BIP-68/112 - OP_CHECKSEQUENCEVERIFY
+        # cannot execute on a transaction with nVersion < 2 (Bitcoin
+        # Core's TransactionSignatureChecker::CheckSequence returns
+        # false), so the S_v IF/CSV branch would make the co-signed tx
+        # consensus-invalid. Emergency/exit take the ELSE branch (no CSV
+        # executes) and stay valid at v1, so the requirement is
+        # ladder-specific. Unknown version (host-test view without the
+        # fact) fails closed.
+        v = view.get("tx_version")
+        if v is None or v < 2:
+            raise VaultViolation("ladder: nVersion >= 2 required (BIP-68/112)")
         # INV-SEQ: vault spends are cadence-committed; exactly N, height form.
         for i in view["inputs"]:
             if i["spk"] != self.spk_v:
@@ -295,10 +343,41 @@ class VaultPolicy:
                 raise VaultViolation("SEQ: time-form refused")
             if cls != "csv" or n != self.n:
                 raise VaultViolation("SEQ: nSequence != N")
+        # W-02 (validity audit #2): ladders are signature-bearing - the
+        # device's BIP-143 digest embeds the input's nValue, so a
+        # witness-utxo-only claim (never txid-cross-checked) would bind
+        # the co-signature to an amount the real coin does not have:
+        # consensus-invalid on-chain, and the user-facing "spent" amount
+        # would be the attacker's claim. Same INV-UTXO rule as P1/P3.
+        self._require_full_utxo(view, "P2")
+        # W-03 (validity audit #2): fee floor. Zero-fee transactions do
+        # not relay (min-relay policy); refuse them like P1/P3 does.
+        # NOTE (documented decision): there is deliberately NO ceiling for
+        # ladders - after the cadence a 2-of-3 quorum can already withdraw
+        # the full amount anywhere, so a fee cap adds no security; the
+        # P1/P3 windows exist to bound the no-timelock paths.
+        self._require_relayable_fee(view, "P2")
         spent = sum(i["value"] for i in view["inputs"] if i["spk"] == self.spk_v)
         if any(o["spk"] == self.spk_v for o in view["outputs"]):
             return "ladder: state transition (%d sats spent)" % spent
         return "ladder: withdrawal (%d sats spent)" % spent
+
+    def _require_relayable_fee(self, view, tag):
+        # W-04/W-03 (validity audit #2): the fee must meet a min-relay
+        # floor (1 sat/vByte against a conservative vsize estimate) so a
+        # policy-approved transaction is actually broadcastable. Fail
+        # closed when values are missing (cannot compute).
+        try:
+            fee = (sum(i["value"] for i in view["inputs"]) -
+                   sum(o["value"] for o in view["outputs"]))
+        except Exception:
+            raise VaultViolation("%s: cannot compute fee" % tag)
+        if fee is None:
+            raise VaultViolation("%s: cannot compute fee" % tag)
+        floor = _min_relay_fee(view)
+        if fee < floor:
+            raise VaultViolation("%s: fee %d below min-relay floor %d"
+                                 % (tag, fee, floor))
 
     def _check_exit(self, view):
         # P2 (spend-forbid) is enforced structurally: _classify routes
@@ -312,6 +391,7 @@ class VaultPolicy:
         fee = view["inputs"][0]["value"] - view["outputs"][0]["value"]
         if not (0 < fee <= self.f0_max):
             raise VaultViolation("P3: fee out of window")
+        self._require_relayable_fee(view, "P3")
         # belt-and-braces behind the E-2 script: K1's sig must already be present
         # (validity of that signature - DER shape, low-S, SIGHASH_ALL and
         # the ECDSA check against the BIP-143 digest - is enforced by

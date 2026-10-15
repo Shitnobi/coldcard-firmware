@@ -458,3 +458,46 @@ landed on `vault-cosign-policy-fixes`. Commits, in order:
 (`vault_impl_version`, currently 2) that produced them, plus the
 enrollment timestamp and policy hashes at save time. The cfg schema is
 otherwise unchanged — no migration for enrolled policies.
+
+## Session 2026-10-15 (j) — validity audit #2: W-01..W-05 fixed on master
+
+Second audit round, focused on **validity** rather than security: bugs
+that produce consensus-invalid or non-standard transactions after the
+device co-signs, and coverage gaps in the policy gate. Report:
+`/home/shinobi/AI-Trident/vault-validity-audit.md`; resolution section in
+`docs/vault_audit_advisory.md`. Landed on `master` (previous round was
+merged and pushed as `28ea046d`).
+
+Findings fixed (`vault_impl_version` 2 → 3):
+
+- **W-01** ladders (P2) require `tx_version >= 2` — BIP-68/112 `OP_CSV`
+  cannot execute on v1 transactions, so a signed v1 ladder was
+  consensus-invalid. Fail-closed on unknown version; `view_from_psbt`
+  now carries `tx_version`.
+- **W-02** ladders require **full UTXOs** (`_require_full_utxo`), same
+  as P1/P3 — a spoofed witness-utxo amount was bound into the BIP-143
+  digest and the device signature.
+- **W-03** `_require_relayable_fee` floor (conservative 1 sat/vByte
+  estimate) on all three fee-bearing classes; ladder fee ceiling
+  deliberately omitted (post-cadence quorum owns everything) — pinned
+  by regression case B3.
+- **W-04** `DUST_LIMIT = 546` on every output of every policy class
+  (OP_RETURN exempt) — previously 500-sat dust and fee=1 emergencies
+  were approved.
+- **W-05** enrollment refuses `sv_hash == spk_e` (self-inflicted
+  emergency DoS: P1 would re-route to the exit checker and refuse
+  forever).
+
+Design pins (regression-pinned, not bugs): **W-06** ladder allows
+foreign inputs/arbitrary destinations — after the CSV cadence the 2-of-3
+quorum can spend unconditionally anyway (B10).
+
+Regression suite: `unix/work/audit2_probe.py` rewritten as an
+assertion-based suite (22/22) running through the REAL simulator signing
+chain — same phase pattern as the V-round. Host suites updated
+(`txn_version=2` on fakes, `txv`/`utxo_full` knobs on the policy view
+fixture, `test_validity_audit2` added).
+
+Full battery on this tree: policy 10/10, vault 89/89, hardening 43/43,
+witness_order 6/6, sign_sim 45/45, sim_e2e 25/25, audit_probe (V-round)
+49/49, audit2_probe (W-round) 22/22.
