@@ -82,16 +82,23 @@ class SpendingPolicy(dict):
         pol = self
 
         # Vault co-signer mode: when a vault policy is enrolled and this PSBT
-        # is vault-relevant, the vault rule layer (vault_policy.py, enforced
-        # at the auth.py choke point) owns the timing constraints. Vault txs
-        # commit nLockTime == 0, which the height-based velocity ratchet
-        # below would always refuse. Belt-and-suspenders: warnings,
-        # magnitude and whitelist checks still apply to vault txs.
+        # is PROVABLY a vault transaction, the vault rule layer
+        # (vault_policy.py, enforced at the auth.py choke point) owns the
+        # timing constraints. Vault txs commit nLockTime == 0, which the
+        # height-based velocity ratchet below would always refuse.
+        # Belt-and-suspenders: warnings, magnitude and whitelist checks
+        # still apply to vault txs.
+        # V-06 fix (plan 3.1): is_vault_psbt is a strict fail-closed
+        # predicate (cfg parses, every input verifiable, at least one
+        # input structurally matches the enrolled S_v/S_e) - unlike the
+        # old check_relevance call, whose "odd shape => relevant" refusal
+        # polarity let a crafted PSBT skip the ratchet while the vault
+        # gate never actually judged it. Any doubt => ratchet applies.
         vault_tx = False
         try:
             import vault
             if vault.VaultMode.is_enabled():
-                vault_tx = vault.check_relevance(psbt, vault._cfg())
+                vault_tx = vault.is_vault_psbt(psbt, vault._cfg())
         except Exception:
             vault_tx = False
 

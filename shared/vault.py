@@ -83,6 +83,10 @@ def _iter_input_utxos(psbt):
         for idx, txin in psbt.input_iter():
             inp = psbt.inputs[idx]
             if not (getattr(inp, 'utxo', None) or getattr(inp, 'witness_utxo', None)):
+                # section 3.2: surface (spk=None) instead of silently
+                # skipping - check_relevance treats it as relevant and
+                # the policy layer refuses it loudly
+                yield None, None, False
                 continue
             u = inp.get_utxo(idx)
             yield bytes(u.scriptPubKey), u.nValue, _spk_verified(inp)
@@ -130,6 +134,12 @@ def check_relevance(psbt, cfg):
         if not (spk_v or spk_e):
             return False
         for spk, val, verified in _iter_input_utxos(psbt):
+            if spk is None:
+                # input with no utxo data at all (section 3.2): could be
+                # a hidden vault coin - treat as relevant so the policy
+                # layer (view_from_psbt) refuses it loudly instead of the
+                # relevance sniff silently skipping it
+                return True
             if (spk_v and spk == spk_v) \
                     or (spk_e and spk == spk_e):
                 return True
@@ -137,9 +147,63 @@ def check_relevance(psbt, cfg):
                 # unverifiable spk claim: could be a hidden vault coin,
                 # fail closed - let the policy layer judge it
                 return True
-    except Exception:
-        return True     # odd shape: treat as relevant, policy will judge
+    except Exception as e:
+        # odd shape: treat as relevant, policy will judge - but log it so
+        # a misclassification is auditable in vault.log (section 3.2)
+        try:
+            vault_log('relevance: odd shape treated as relevant: %s' % e)
+        except Exception:
+            pass
+        return True
     return False
+
+
+def is_vault_psbt(psbt, cfg):
+    # Section 3.1 (V-06 fix): STRICT fail-closed predicate for the CCC
+    # velocity-ratchet skip. Unlike check_relevance (a refusal-gate
+    # sniff, where odd shapes must count as relevant so the policy layer
+    # refuses them), this returns True ONLY for provably-vault PSBTs:
+    #   (a) the cfg parses and has a enrolled script hash,
+    #   (b) EVERY input carries verifiable utxo data (full utxo, or a
+    #       witness utxo whose witness script hashes to the claimed spk),
+    #   (c) at least one input's spk matches the enrolled S_v/S_e hash
+    #       AND its witness script structurally parses as that kind.
+    # Any doubt => False => the velocity ratchet still applies. The
+    # audit's V-06 was the fail-open inverse: check_relevance's
+    # exception path returned True for "odd shapes", so a crafted PSBT
+    # could skip the ratchet while the vault gate (if mode was off, or
+    # the psbt only looked vault-ish) never judged it.
+    try:
+        spk_v = _h2b((cfg or {}).get('sv_hash'))
+        spk_e = _h2b((cfg or {}).get('spk_e'))
+        if not (spk_v or spk_e):
+            return False
+        import vault_signing
+        seen_vault = False
+        for idx, txi in psbt.input_iter():
+            inp = psbt.inputs[idx]
+            if not (getattr(inp, 'utxo', None) or
+                    getattr(inp, 'witness_utxo', None)):
+                return False
+            if not _spk_verified(inp):
+                return False
+            spk = bytes(inp.get_utxo(idx).scriptPubKey)
+            if not (spk == spk_v or spk == spk_e):
+                continue
+            ws = getattr(inp, 'witness_script', None)
+            if not ws:
+                return False
+            if isinstance(ws, (tuple, list)):
+                script = inp.get(ws)
+            else:
+                script = ws
+            if vault_signing.recognize(script, cfg) != \
+                    ('sv' if spk == spk_v else 'se'):
+                return False
+            seen_vault = True
+        return seen_vault
+    except Exception:
+        return False
 
 
 def view_from_psbt(psbt):
@@ -354,8 +418,42 @@ def save_cfg(cfg):
     # - immediate save: nvstore.set() (=put) only marks the store dirty
     #   with a 250ms deferred write, so power loss in that window would
     #   silently lose the change. master_set always saves immediately.
+    # - section 3.4: stamp the first-seen enrollment time and log the
+    #   policy hashes so the enrollment is auditable in vault.log and
+    #   displayable in the policy viewer.
+    cfg = dict(cfg)
+    if not cfg.get('enrolled_ts'):
+        try:
+            import utime
+            cfg['enrolled_ts'] = int(utime.time())
+        except Exception:
+            try:
+                import time
+                cfg['enrolled_ts'] = int(time.time())
+            except Exception:
+                pass
     from glob import settings
     settings.master_set('vault', cfg)
+    vault_log('CFG saved: n=%s f0_max=%s sv_hash=%s... spk_e=%s... '
+              'exit_spk=%s...%s'
+              % (cfg.get('n'), cfg.get('f0_max'),
+                 (cfg.get('sv_hash') or '')[:16],
+                 (cfg.get('spk_e') or '')[:16],
+                 (cfg.get('exit_spk') or '')[:16],
+                 ' ts=%s' % cfg['enrolled_ts'] if cfg.get('enrolled_ts') else ''))
+
+
+def human_ts(ts):
+    # Format the 'enrolled_ts' epoch stamp for the policy viewer
+    # (vault_menu 'Show Policy'). Host-testable: on the unix build
+    # utime.time()/gmtime exist via the time module shim.
+    try:
+        import utime
+        t = utime.gmtime(int(ts))
+    except Exception:
+        import time
+        t = time.gmtime(int(ts))
+    return '%d-%02d-%02d %02d:%02d UTC' % (t[0], t[1], t[2], t[3], t[4])
 
 
 def wipe():

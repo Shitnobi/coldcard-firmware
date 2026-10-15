@@ -1813,8 +1813,10 @@ class psbtObject(psbtProxy):
         if self.total_value_out is None:
             self.total_value_out = total_out
         else:
-            assert self.total_value_out == total_out, \
-                '%s != %s' % (self.total_value_out, total_out)
+            if self.total_value_out != total_out:
+                # plan 3.3: was an assert - fail closed instead
+                raise FatalPSBTIssue('Output total changed: %s != %s'
+                                     % (self.total_value_out, total_out))
 
         if self.total_change_value is None:
             self.total_change_value = total_change
@@ -2031,7 +2033,9 @@ class psbtObject(psbtProxy):
             # pull out just the CTXOut object (expensive)
             utxo = inp.get_utxo(txi.prevout.n)
 
-            assert utxo.nValue >= 0, "negative input value: i%d" % i
+            if utxo.nValue < 0:
+                # plan 3.3: was an assert - fail closed instead
+                raise FatalPSBTIssue('negative input value: i%d' % i)
             total_in += utxo.nValue
             if not inp.utxo and not inp.witness_utxo_is_provably_segwit(utxo):
                 unverified_witness_utxo.append(i)
@@ -2428,7 +2432,10 @@ class psbtObject(psbtProxy):
                     continue
 
                 txi.scriptSig = inp.scriptSig
-                assert txi.scriptSig, "no scriptsig?"
+                if not txi.scriptSig:
+                    # plan 3.3: was an assert - fail closed instead
+                    raise FatalPSBTIssue('no scriptsig for input #%d?'
+                                         % in_idx)
 
                 inp.handle_none_sighash()
                 if self.por322:
@@ -2446,7 +2453,8 @@ class psbtObject(psbtProxy):
                         if node:
                             break
                     else:
-                        raise AssertionError("Input #%d needs pubkey I dont have" % in_idx)
+                        raise FatalPSBTIssue(
+                            "Input #%d needs pubkey I dont have" % in_idx)
 
                 else:
                     # single pubkey <=> single key
@@ -2669,7 +2677,10 @@ class psbtObject(psbtProxy):
         rv.update(replacement.prevout.serialize())
 
         # the "scriptCode" ... not well understood
-        assert scriptCode, 'need scriptCode here'
+        if not scriptCode:
+            # plan 3.3: was an assert - fail closed instead (vault inputs
+            # reach this with a witness-script-derived scriptCode)
+            raise FatalPSBTIssue('need scriptCode here')
         rv.update(scriptCode)
 
         rv.update(pack("<q", amount))

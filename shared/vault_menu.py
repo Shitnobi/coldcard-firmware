@@ -43,6 +43,7 @@ class VaultConfigMenu(MenuSystem):
             MenuItem('Max Fee (sats)', f=self.set_fee),
             MenuItem('Exit Destination', f=self.show_exit),
             MenuItem('Show Commitment Root', f=self.show_root),
+            MenuItem('Show Policy', f=self.show_policy),
         ]
         if enrolled:
             items.append(MenuItem('Wipe Policy', f=self.wipe))
@@ -176,6 +177,38 @@ class VaultConfigMenu(MenuSystem):
         else:
             msg = '(lattice not yet enrolled)'
         await ux_show_story('Lattice commitment:\n\n%s' % msg, title='VAULT')
+
+    async def show_policy(self, *a):
+        # Phase 3.4: full policy-details viewer. Lets the operator
+        # confirm, on-device, the exact scriptPubKeys the enrolled
+        # policy pins (sv_hash = the S_v script hash => the P2WSH
+        # address deposits go to; spk_e = the emergency sink), the exit
+        # destination, cadence and fee window, plus when the policy was
+        # enrolled ('enrolled_ts', stamped by vault.save_cfg).
+        cfg = vault._cfg()
+        if not cfg:
+            await ux_show_story('(no policy enrolled)', title='VAULT')
+            return
+
+        def short(x):
+            # 32-byte values shown truncated: the same leading bytes the
+            # save_cfg vault_log line records, enough to eyeball-match
+            # against the host UI without a 64-char wall of hex.
+            x = x or ''
+            return ('%s...' % x[:16]) if len(x) > 20 else (x or '(not set)')
+
+        ts = cfg.get('enrolled_ts')
+        ts_msg = ('enrolled %s' % vault.human_ts(ts)) if ts else \
+                 '(enrolled before ts stamping)'
+        msg = ('Vault spk (sv_hash):\n%s\n\n'
+               'Emergency spk (spk_e):\n%s\n\n'
+               'Exit dest (exit_spk):\n%s\n\n'
+               'Cadence N: %s   Max fee: %s\n\n'
+               'Enabled: %s\n\n%s'
+               % (short(cfg.get('sv_hash')), short(cfg.get('spk_e')),
+                  short(cfg.get('exit_spk')), cfg.get('n'), cfg.get('f0_max'),
+                  'yes' if cfg.get('enabled') else 'no', ts_msg))
+        await ux_show_story('Enrolled policy:\n\n%s' % msg, title='VAULT')
 
     async def enroll_lattice(self, *a):
         # Lattice commitment plan T5: select .psbt files one at a time
