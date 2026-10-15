@@ -13,6 +13,9 @@ MICROPY_VFS_FAT = 1
 # see py/mpconfig.h which uses this var if set
 CFLAGS_EXTRA += -DMP_CONFIGFILE=\"boards/$(BOARD)/ckcc-port.h\"
 CFLAGS_EXTRA += -DCOLDCARD_DEBUG=$(DEBUG_BUILD)
+# build-compat: newer host/arm GCC (>=12) warnings that this older
+# micropython does not trigger; keep them non-fatal for test builds
+CFLAGS_EXTRA += -Wno-error=dangling-pointer -Wno-error=enum-int-mismatch -Wno-error=stringop-overflow -Wno-error=return-type
 
 # obsolete
 # need the CDC inf file to be built before this file

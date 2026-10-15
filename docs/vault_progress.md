@@ -815,3 +815,34 @@ Remaining deliberately-uncovered item (unchanged from (p)): the
 'incorrect-output' funding mode on-chain (classification is
 unit-tested; on-chain behavior is identical to input-only's rebuild
 path).
+
+## (r) firmware builds for on-device testing; freeze-manifest bug found
+
+Built the real STM32 firmware (MK-Makefile, DEBUG_BUILD=0, Mk4+Mk5)
+locally with the host arm-none-eabi toolchain, signed with the
+PUBLIC dev key 0 (the standard experimental-firmware route: the
+bootrom shows a warning + delay, then boots): stm32/dev.dfu
+(v5.6.3, hw_compat Mk4+Mk5, ~299 KB flash headroom).
+
+**Bug found by the build**: the four vault modules (vault.py,
+vault_policy.py, vault_signing.py, vault_menu.py) were copied into
+shared/ but never added to shared/manifest.py's freeze_as_mpy list
+- the board 'shared/' dirs are symlinks to the root shared/, so
+both MK4 and Q1 manifests come from that one file. The firmware
+compiled and linked fine, but 'import vault' in auth.py would have
+raised ImportError ON-DEVICE ONLY (the sim loads from MICROPYPATH,
+so every sim test passed while the frozen image was broken).
+Fixed by adding all four to the opt=0 freeze list (asserts must
+survive); verified present in frozen_content.c after rebuild.
+
+Also: build-compat flags (-Wno-error=dangling-pointer,
+enum-int-mismatch, stringop-overflow, return-type) added to both
+boards' mpconfigboard.mk - this older micropython does not compile
+clean under GCC >= 12 without them.
+
+Toolchain notes for future builds: cli/ must be pip-installed (for
+signit); 'make setup' needs autotools for libngu's secp256k1
+autogen, but the precomputed_ecmult tables are committed in the
+submodule, so the autogen step can be skipped entirely (just build
+mpy-cross with -Wno-error=enum-int-mismatch and create the
+l-port/l-mpy/board symlinks).
