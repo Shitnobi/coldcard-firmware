@@ -613,3 +613,33 @@ Battery on this tree (spot after the framework patch — no `shared/`
 or firmware files touched): sim_e2e 25/25, sign_sim 45/45, audit3
 23/23, plus the oracle selfcheck (emergency + ladder rounds, 22
 checks) all green.
+
+## (m) Host app GUI + comprehensive test battery: leaf PSBT enroll bug found and fixed
+
+Session 2026-10-15 (cont). The host app (now standalone at
+Shitnobi/coldcard-vault-hostapp) got a tkinter GUI (funding PSBT
+paste/decode, policy fields, preview, build, lattice-root copy) and a
+three-tier test battery. Real tkinter 8.6.14 was installed locally
+(no sudo) from extracted debs to test on a real X display.
+
+The deepest tier — a GUI-built tree fed through the **real coldcard-mpy
+simulator** (`VAULT_E2E_DIR=<tree> unix/vault_sim_e2e.py`) — caught a
+real enroll-blocking bug in the host app's leaf PSBTs:
+
+- **Bug**: leaf input maps carried only `0x01` witness utxo. Device
+  `_verify_vault_partials` (vault.py, enroll_lattice) requires
+  `0x05` witness script S_v and `0x00` full UTXO on vault inputs, so
+  enrollment raised `lattice[0]: witness-utxo input missing witness
+  script`. Host-app leaves could never have been enrolled on a real
+  Coldcard before this fix.
+- **Fix**: leaf input map now carries `0x01` witness utxo + `0x05`
+  witness script S_v + `0x00` full UTXO (dep_tx). Applied to BOTH
+  `hostapp/vault_tree.py` here and the standalone repo copy. The
+  lattice root is unaffected (it commits to unsigned tx bytes only):
+  `1c8b7fc230cdcdccd4bf3fc7e38cdf92f22973e1f5ff68a092aa5d581407db86`.
+
+Battery after the fix (both repos' trees): hostapp 113/113, GUI
+logic 29/29, GUI smoke 15/15, GUI real-tkinter 17/17 (real clicks,
+clipboard, mainloop), sim e2e 19/19 on a hostapp-built tree, firmware
+policy 11/11, firmware sim e2e 25/25; `vault_policy.py` verified
+byte-identical across repos.
