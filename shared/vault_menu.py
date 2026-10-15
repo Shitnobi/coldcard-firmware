@@ -99,6 +99,13 @@ class VaultConfigMenu(MenuSystem):
         # Lattice' flow (device root shown, compared to the host, then
         # stored). Strip it from the file so a hostile or stale policy
         # JSON cannot pre-load an unconfirmed lattice root.
+        # NOTE on 'strict' (X-03, consistency audit #3): it is NOT
+        # stripped - per the issue-#12/Q3 design decision there is
+        # deliberately no strict menu; re-enrolling a policy file is the
+        # intended way to change it. The audit's real concern was a
+        # *silent* posture change, which is closed by surfacing the
+        # strict status in the enrollment confirmation below and in the
+        # 'Show Policy' viewer instead.
         for k in ('lattice_root', 'lattice_count'):
             cfg.pop(k, None)
 
@@ -111,13 +118,31 @@ class VaultConfigMenu(MenuSystem):
         vault.vault_log('CFG enrolled')
         await ux_show_story('Vault policy enrolled (disabled).\n\n'
                             'Review Cadence N / Max Fee / Exit Destination,\n'
-                            'then enable Vault Mode.', title='VAULT')
+                            'then enable Vault Mode.\n\n'
+                            'Strict signer mode: %s'
+                            % ('ON - refuses ALL non-vault spends'
+                               if cfg.get('strict') else 'off'),
+                            title='VAULT')
         self.update_contents()
 
     async def set_n(self, *a):
         cfg = vault._cfg()
         if not vault.validate_cfg(cfg)[0]:
             await ux_show_story('Enroll a valid policy first.', title='VAULT')
+            return
+        # X-03 (consistency audit #3): refuse cadence edits while vault
+        # mode is enabled. The funded S_v committed its N at enrollment;
+        # a different cfg n now cannot change what consensus enforces -
+        # with the X-02 recognition cross-check it makes every ladder
+        # refuse (fail-closed fund-lock) rather than signing a
+        # consensus-invalid spend. Same 'enrolls dark' posture as policy
+        # enrollment: edit while disabled, review, then re-enable.
+        if cfg.get('enabled'):
+            await ux_show_story(
+                'Disable Vault Mode before changing Cadence N.\n\n'
+                'The funded vault committed its scripts with the '
+                'enrolled N - a different N makes every ladder refuse '
+                'until it is reverted.', title='VAULT')
             return
         val = await ux_enter_number('Cadence N (blocks):', max_value=0xFFFF,
                                     value=cfg.get('n', 1008))
@@ -204,10 +229,11 @@ class VaultConfigMenu(MenuSystem):
                'Emergency spk (spk_e):\n%s\n\n'
                'Exit dest (exit_spk):\n%s\n\n'
                'Cadence N: %s   Max fee: %s\n\n'
-               'Enabled: %s\n\n%s'
+               'Enabled: %s   Strict: %s\n\n%s'
                % (short(cfg.get('sv_hash')), short(cfg.get('spk_e')),
                   short(cfg.get('exit_spk')), cfg.get('n'), cfg.get('f0_max'),
-                  'yes' if cfg.get('enabled') else 'no', ts_msg))
+                  'yes' if cfg.get('enabled') else 'no',
+                  'yes' if cfg.get('strict') else 'no', ts_msg))
         await ux_show_story('Enrolled policy:\n\n%s' % msg, title='VAULT')
 
     async def enroll_lattice(self, *a):

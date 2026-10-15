@@ -182,3 +182,34 @@ unix/work/audit_probe.py          49/49  (V-01..V-07 regression, re-run)
 The on-chain scripts are unchanged; the fixes are entirely device-side,
 so enrolled vaults need no migration. The cfg schema is unchanged except
 `vault_impl_version` in ledger entries (2 → 3).
+
+---
+
+## Resolution — consistency audit #3 (X-01..X-03, 2026-10-15, master)
+
+Third audit round (script-vs-config consistency / degenerate scripts):
+report `/home/shinobi/AI-Trident/vault-consistency-audit.md`. No class-1/2
+findings; two class-3 and one class-4, all fixed (`vault_impl_version`
+3 → 4).
+
+| ID | Fixed by | What changed |
+|----|----------|--------------|
+| X-01 | this round | both script parsers refuse duplicate pubkeys (pairwise-distinct K1/K2/K3); a hash-matching degenerate script now fails closed at recognition instead of approving a single-party-satisfiable "quorum" |
+| X-02 | this round | `recognize()` requires the parsed S_v script's N to equal the enrolled cfg `n` — the device can no longer co-sign a ladder that `OP_CSV` will reject on-chain (or refuse one consensus would accept) |
+| X-03 | this round | `set_n` refuses edits while vault mode is enabled; the `strict` posture is surfaced in the enrollment story + 'Show Policy' viewer (NOT stripped — see below) |
+
+**Deviation from the audit's literal X-03 text, recorded here for the
+release trail:** the report prescribed stripping `strict` from imported
+policy JSON. Implemented instead: surface it. Stripping would make
+strict mode permanently unreachable, contradicting the issue-#12/Q3
+design decision (deliberately no strict menu; re-enroll to change). The
+audit's actual concern — a *silent* posture change from a file — is
+closed by making the posture visible at enrollment and in the policy
+viewer. The X-02 recognition check independently guarantees no
+divergent-cadence signature can be produced even if a cfg edit
+bypasses the menu guard.
+
+Test evidence: `unix/work/audit3_probe.py` 23/23 (findings-verified
+17/17), full battery as listed in the progress ledger session (k).
+On-chain scripts unchanged; fixes are entirely device-side; no cfg
+migration (impl version stamp only).

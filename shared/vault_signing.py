@@ -231,12 +231,28 @@ def recognize(wscript, cfg):
         if want and want[2:] == h:
             try:
                 if kind == 'sv':
-                    parse_vault_script(wscript)
+                    parsed = parse_vault_script(wscript)
                 else:
-                    parse_deepvault_script(wscript)
+                    parsed = parse_deepvault_script(wscript)
             except VaultViolation as e:
                 raise VaultViolation('vault script hash matches %s but '
                                      'structure invalid: %s' % (field, e))
+            if kind == 'sv':
+                # X-02 (consistency audit #3): the ladder sequence check
+                # judges nSequence against the *enrolled cfg n*, while
+                # BIP-112 OP_CSV on-chain judges it against the *script's
+                # N*. A divergence (mis-enrolled JSON, or a set_n edit
+                # after funding) makes the device sign consensus-invalid
+                # ladders (cfg n < script N) or refuse on-chain-valid
+                # ones (cfg n > script N). The device enrolls only the
+                # spk hash, so this recognition point is the only place
+                # the two can be reconciled: fail closed on mismatch.
+                cfg_n = (cfg or {}).get('n', 1008)
+                if not isinstance(cfg_n, int) or isinstance(cfg_n, bool) \
+                        or cfg_n != parsed['n']:
+                    raise VaultViolation(
+                        'sv script N=%d != enrolled cfg n=%r: cadence '
+                        'mismatch' % (parsed['n'], cfg_n))
             return kind
     return None
 

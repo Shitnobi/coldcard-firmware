@@ -123,7 +123,7 @@ res, msg = vault.validate_cfg(dict(CFG))
 assert res, msg
 vault.save_cfg(dict(CFG, enabled=1))
 ok('setup: cfg validates', vault.validate_cfg(dict(CFG))[0])
-ok('setup: impl version 3', vault.VAULT_IMPL_VERSION == 3)
+ok('setup: impl version 4', vault.VAULT_IMPL_VERSION == 4)
 
 # ---- PSBT v0 builder -------------------------------------------------------
 def vi(n):

@@ -36,7 +36,13 @@ VAULT_LOG = 'vault.log'
 #   3 = validity audit #2 round: ladders require nVersion >= 2 (W-01) and
 #       full UTXOs (W-02); dust/min-relay standardness floors on all
 #       classes (W-03/W-04); sv_hash != spk_e at enrollment (W-05)
-VAULT_IMPL_VERSION = 3
+#   4 = consistency audit #3 round: script parsers refuse duplicate
+#       pubkeys (X-01, quorum collapse); recognize() cross-checks the
+#       script's N against the enrolled cfg n (X-02, consensus-valid
+#       ladders); set_n refuses edits while vault mode is enabled and
+#       the strict posture is surfaced at enrollment + policy viewer
+#       (X-03)
+VAULT_IMPL_VERSION = 4
 
 
 def _cfg():

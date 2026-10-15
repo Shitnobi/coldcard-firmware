@@ -314,6 +314,76 @@ def test_lattice_commitment():
         pass
 
 
+def test_consistency_audit3():
+    # Regression coverage for the validity audit #3 findings (X-01/X-02):
+    # script-vs-config consistency and degenerate-script enrollment.
+    #
+    # X-01: parse_vault_script / parse_deepvault_script must refuse
+    # DUPLICATE pubkeys - a "2-of-3" S_v with K1==K2 is satisfiable by a
+    # single party (CHECKMULTISIG matches two sigs from one key against
+    # the duplicate pubkeys), and the S_v ELSE branch has no CSV: silent
+    # total quorum collapse.
+    #
+    # X-02: recognize() must cross-check the parsed script's N against
+    # the enrolled cfg cadence n - a hash-matching script with a
+    # mismatched N is a mis-enrollment (or a post-enrollment set_n edit)
+    # that would make the device co-sign transactions failing OP_CSV.
+
+    def sv_ws(k1, k2, k3, n=N):
+        return (bytes([0x63]) + push_num(n) + bytes([0xB2, 0x75, 0x67, 0x68, 0x52])
+                + push_data(k1) + push_data(k2) + push_data(k3) + bytes([0x53, 0xAE]))
+
+    def se_ws(k1, k2, k3):
+        # E-2: <K1> OP_CHECKSIGVERIFY OP_1 <K2> <K3> OP_2 OP_CMS (106 B)
+        return (push_data(k1) + bytes([0xAD, 0x51])
+                + push_data(k2) + push_data(k3) + bytes([0x52, 0xAE]))
+
+    # honest scripts still parse, with distinct keys
+    q = vp.parse_vault_script(sv_ws(K1, K2, K3))
+    assert q['n'] == N and q['keys'] == [K1, K2, K3]
+    e = vp.parse_deepvault_script(se_ws(K1, K2, K3))
+    assert e['k1'] == K1 and e['k2'] == K2 and e['k3'] == K3
+    assert e['k1'] != e['k2'] and e['k1'] != e['k3'] and e['k2'] != e['k3']
+    assert len(se_ws(K1, K2, K3)) == 106          # E-2 pinned length
+
+    # X-01: every duplicate-pubkey permutation of S_v refused
+    for k1, k2, k3 in [(K1, K1, K3), (K1, K2, K1), (K1, K2, K2), (K1, K1, K1)]:
+        expect_parse(vp.parse_vault_script, sv_ws(k1, k2, k3))
+
+    # X-01: same permutations for S_e
+    for k1, k2, k3 in [(K1, K1, K3), (K1, K2, K1), (K1, K2, K2), (K1, K1, K1)]:
+        expect_parse(vp.parse_deepvault_script, se_ws(k1, k2, k3))
+
+    # X-02 + X-01 at the recognition layer (hash-match is not enough)
+    try:
+        import vault_signing as vsig
+    except ImportError:
+        print('skip: vault_signing not importable under CPython')
+        return
+
+    spk_se = vp.p2wsh_spk(se_ws(K1, K2, K3))
+    base_cfg = {'spk_e': spk_se.hex(), 'k1_pubkey': K1.hex(), 'n': N}
+
+    # controls: hash-matching script with cfg n == script N is 'sv'/'se'
+    assert vsig.recognize(WS_V, dict(base_cfg, sv_hash=SPK_V.hex())) == 'sv'
+    ws_n = sv_ws(K1, K2, K3, n=N + 1)
+    assert vsig.recognize(ws_n, dict(base_cfg, n=N + 1,
+                                     sv_hash=vp.p2wsh_spk(ws_n).hex())) == 'sv'
+    assert vsig.recognize(se_ws(K1, K2, K3),
+                          dict(base_cfg, sv_hash=SPK_V.hex())) == 'se'
+
+    # X-02: hash-matching sv script, cfg n != script N -> refuse
+    expect_parse(vsig.recognize, ws_n,
+                 dict(base_cfg, sv_hash=vp.p2wsh_spk(ws_n).hex()))
+
+    # X-01: hash-matching duplicate-key script -> refuse (fail closed)
+    expect_parse(vsig.recognize, sv_ws(K1, K1, K3),
+                 dict(base_cfg, sv_hash=vp.p2wsh_spk(sv_ws(K1, K1, K3)).hex()))
+    expect_parse(vsig.recognize, se_ws(K1, K1, K3),
+                 dict(base_cfg, sv_hash=SPK_V.hex(),
+                      spk_e=vp.p2wsh_spk(se_ws(K1, K1, K3)).hex()))
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
 
 if __name__ == '__main__':

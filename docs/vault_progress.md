@@ -501,3 +501,68 @@ fixture, `test_validity_audit2` added).
 Full battery on this tree: policy 10/10, vault 89/89, hardening 43/43,
 witness_order 6/6, sign_sim 45/45, sim_e2e 25/25, audit_probe (V-round)
 49/49, audit2_probe (W-round) 22/22.
+
+## Session 2026-10-15 (k) — consistency audit #3: X-01..X-03 fixed on master
+
+Third audit round, on **script-vs-config consistency and degenerate-script
+enrollment** — the boundary the first two rounds did not cover: the device
+enrolls only the spk *hash*, so every assumption the policy makes about
+script CONTENTS must be re-verified against the parsed script at spend
+time. Report: `/home/shinobi/AI-Trident/vault-consistency-audit.md`;
+resolution section in `docs/vault_audit_advisory.md`. Landed on `master`
+(head was `e1d4218c`).
+
+Findings fixed (`vault_impl_version` 3 → 4):
+
+- **X-01** (class 3) `parse_vault_script` / `parse_deepvault_script`
+  refuse **duplicate pubkeys** (all three pairwise distinct, both
+  scripts). `OP_CHECKMULTISIG` has no distinctness rule: an S_v with
+  K1==K2 is single-party-satisfiable and the ELSE branch carries no CSV
+  — silent total quorum collapse the device previously waved through
+  (the probe's C4 finalized a single-party vault witness). Spend-time
+  recognition is the only device-side defense (only the spk hash is
+  enrolled), so the parsers are where it fails closed.
+- **X-02** (class 3) `vault_signing.recognize` cross-checks the parsed
+  S_v script's **N against the enrolled cfg `n`** (default 1008,
+  aligned with `VaultPolicy`). The ladder sequence check judges
+  nSequence against cfg n while BIP-112 `OP_CSV` on-chain judges it
+  against the script N — a divergence (mis-enrolled JSON or a post-
+  funding `set_n` edit) previously made the device SIGN
+  consensus-invalid ladders (cfg n < N; probe C2/C3) while refusing
+  on-chain-valid ones (cfg n > N; C2b). Now a mismatch raises at
+  recognition → `FatalPSBTIssue` on the real path, `is_vault_psbt`
+  → False (ratchet applies). Covers every route to the divergence.
+- **X-03** (class 4) `set_n` refuses cadence edits while vault mode is
+  **enabled** (same enrolls-dark posture as policy enrollment). For the
+  related enrollment-integrity gap (imported JSON silently enabling
+  `strict`), the fix **deviates from the audit's literal text** and for
+  good reason: stripping `strict` at enrollment would have made strict
+  mode permanently unreachable, contradicting the recorded issue-#12/Q3
+  design decision ("no strict menu — re-enroll to change"). The audit's
+  real concern was a *silent* posture change; that is closed by
+  **surfacing** the strict status in the enrollment confirmation story
+  and in the 'Show Policy' viewer instead. (Defense in depth: even a
+  bypassed menu edit cannot produce a bad signature — X-02's
+  recognition check refuses the resulting ladder.)
+
+Regression suite: `unix/work/audit3_probe.py` converted from findings
+probe to assertion-based suite (23/23; findings-verified 17/17, controls
+6/6) through the REAL simulator signing chain, same phase pattern as
+the V/W rounds — C2/C2b/C3 (N mismatch both directions + menu-edit
+route), C4 (single-party witness must not finalize), C5/C6 (pure-policy
+role completion must raise), C8/C9 (all duplicate-pubkey permutations,
+both scripts), C10 (guard: honest cfg, seq == N+1 still refused). Host
+coverage: `test_consistency_audit3` added to `testing/test_vault_policy.py`
+(parser permutations + recognize() cross-check controls).
+
+Full battery on this tree: policy 11/11, vault 89/89, hardening 43/43,
+hostapp 113/113, witness_order 6/6, sign_sim 45/45, sim_e2e 25/25,
+audit_probe (V-round) 49/49, audit2_probe (W-round) 22/22, audit3_probe
+(X-round) 23/23.
+
+Observed and left as-is (audit observations O-01..O-05, documented in
+the report): `set_fee` while enabled (no consensus meaning), O-02
+re-enrollment fund-lock (fail-closed, break-glass recoverable),
+`input_iter` CTxIn reuse (audited safe at every call site), lattice
+leaf commitment-only enrollment, OP_RETURN dust exemption (matches
+Core).

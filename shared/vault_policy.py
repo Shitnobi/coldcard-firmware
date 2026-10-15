@@ -130,6 +130,14 @@ def parse_vault_script(wscript):
     k1, pos = _expect_pubkey(wscript, pos)
     k2, pos = _expect_pubkey(wscript, pos)
     k3, pos = _expect_pubkey(wscript, pos)
+    if k1 == k2 or k1 == k3 or k2 == k3:
+        # X-01 (consistency audit #3): OP_CHECKMULTISIG has no pubkey
+        # distinctness rule - two signatures from one private key match
+        # duplicate pubkeys, so K1==K2 collapses the "2-of-3" to a
+        # single party (and the ELSE branch carries no CSV). The device
+        # only enrolls the spk hash, so spend-time recognition is the
+        # only place this can be caught: fail closed here.
+        raise VaultViolation("S_v: duplicate pubkeys collapse the quorum")
     pos = _expect(wscript, pos, 0x53)        # OP_3
     _expect(wscript, pos, OP_CMS)
     return dict(n=n, keys=[k1, k2, k3])
@@ -145,6 +153,10 @@ def parse_deepvault_script(wscript):
     pos = _expect(wscript, pos, 0x51)        # OP_1
     k2, pos = _expect_pubkey(wscript, pos)
     k3, pos = _expect_pubkey(wscript, pos)
+    if k1 == k2 or k1 == k3 or k2 == k3:
+        # X-01 (consistency audit #3): K1==K2 makes "K1 AND one of
+        # {K2,K3}" a single-party exit. Same fail-closed rule as S_v.
+        raise VaultViolation("S_e: duplicate pubkeys collapse the quorum")
     pos = _expect(wscript, pos, 0x52)        # OP_2
     _expect(wscript, pos, OP_CMS)
     return dict(k1=k1, k2=k2, k3=k3)
