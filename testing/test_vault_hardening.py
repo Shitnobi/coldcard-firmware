@@ -232,7 +232,10 @@ class FPsbt:
     def make_txn_segwit_sighash(s, idx, txi, amt, sc, sht):
         assert (amt, sc, sht) == (AMT, script_code, 1), 'digest inputs mismatch'
         return DIGEST
-class FTxi: pass
+class FTxi:
+    # prevout vout 0: vault_signing reads the spent coin via
+    # get_utxo(txi.prevout.n), not the input position
+    prevout = type('po', (), {'n': 0})()
 
 def _try_verify(part, wscript=WS_V):
     p = FPsbt(part)
@@ -292,7 +295,10 @@ class WIn:      # witness-utxo-only (full=False) or full-utxo (full=True) input
 class WPsbt:
     def __init__(s, ins): s.inputs = ins
     def input_iter(s):
-        class TI: nSequence = 0xfffffffd
+        class TI:
+            nSequence = 0xfffffffd
+            # prevout vout 0 (vault reads use txin.prevout.n)
+            prevout = type('po', (), {'n': 0})()
         for i, n in enumerate(s.inputs): yield i, TI()
     def output_iter(s): return iter([])
 

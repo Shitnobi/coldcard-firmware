@@ -5,3 +5,4 @@ qrdata.txt
 *.own
 sim-e2e/
 app-tree/
+core_oracle_*.json

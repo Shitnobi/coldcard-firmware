@@ -264,7 +264,13 @@ class RIn:
     def get(s, val):
         return s._ws if (s.witness_script and val == s.witness_script) else b''
 class RTxIn:
-    def __init__(s, seq): s.nSequence = seq
+    def __init__(s, seq):
+        s.nSequence = seq
+        # prevout vout 0: the vault code reads the spent coin via
+        # get_utxo(txin.prevout.n), never via the input position
+        class _po:
+            n = 0
+        s.prevout = _po()
 class ROut:
     def __init__(s, spk, val): s.scriptPubKey, s.nValue = spk, val
 class RPsbt:

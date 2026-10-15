@@ -64,8 +64,10 @@ def _h2b(x):
 def _iter_input_utxos(psbt):
     # Yield (spk, value, verified) for each input's spent output. Two shapes:
     #  - real firmware psbtObject: utxo/witness_utxo are (pos,len) proxies
-    #    into the PSBT file, so recover the CTxOut via input.get_utxo(idx)
-    #    (which prefers the full non-witness utxo when present)
+    #    into the PSBT file, so recover the CTxOut via input.get_utxo(
+    #    txin.prevout.n) (which prefers the full non-witness utxo when
+    #    present); the spent coin sits at the PREVOUT vout, never at the
+    #    input's position
     #  - host-test fakes: duck-typed .utxo objects.
     # Inputs with no utxo info are skipped here; view_from_psbt refuses
     # them instead (this fn only powers the relevance sniff).
@@ -88,7 +90,7 @@ def _iter_input_utxos(psbt):
                 # the policy layer refuses it loudly
                 yield None, None, False
                 continue
-            u = inp.get_utxo(idx)
+            u = inp.get_utxo(txin.prevout.n)
             yield bytes(u.scriptPubKey), u.nValue, _spk_verified(inp)
     else:
         for inp in psbt.inputs:
@@ -187,7 +189,7 @@ def is_vault_psbt(psbt, cfg):
                 return False
             if not _spk_verified(inp):
                 return False
-            spk = bytes(inp.get_utxo(idx).scriptPubKey)
+            spk = bytes(inp.get_utxo(txi.prevout.n).scriptPubKey)
             if not (spk == spk_v or spk == spk_e):
                 continue
             ws = getattr(inp, 'witness_script', None)
@@ -216,10 +218,14 @@ def view_from_psbt(psbt):
         # (input_iter -> CTxIn), utxos are file proxies, outputs stream
         # via output_iter(); part_sigs is a {pubkey: sig} dict.
         seqs = dict((idx, txin.nSequence) for idx, txin in psbt.input_iter())
+        # spent-output index is the PREVOUT vout, never the input position
+        # (get_utxo indexes the funding tx's outputs) - a vault coin at
+        # vout != input idx must not read a sibling output's spk/amount
+        vouts = dict((idx, txin.prevout.n) for idx, txin in psbt.input_iter())
         for idx, inp in enumerate(psbt.inputs):
             if not (getattr(inp, 'utxo', None) or getattr(inp, 'witness_utxo', None)):
                 raise VaultViolation('missing witness_utxo')
-            u = inp.get_utxo(idx)
+            u = inp.get_utxo(vouts[idx])
             part = getattr(inp, 'part_sigs', None)
             # V-05 fix: mark amount provenance; a witness_utxo-only input
             # is never txid-validated upstream, so fee-bearing classes
@@ -323,7 +329,7 @@ def _verify_vault_partials(cfg, psbt, view):
         inp = psbt.inputs[idx]
         if not getattr(inp, 'has_utxo', lambda: False)():
             continue
-        u = inp.get_utxo(idx)
+        u = inp.get_utxo(txi.prevout.n)
         if bytes(u.scriptPubKey) not in relevant:
             continue
         ws = getattr(inp, 'witness_script', None)

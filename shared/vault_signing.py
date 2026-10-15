@@ -190,7 +190,11 @@ def verify_input_sigs(psbt, idx, inp, txi, wscript):
     # duck-typed against psbtObject: psbt.make_txn_segwit_sighash,
     # inp.get_utxo / inp.get / inp.part_sigs.
     # Raises VaultViolation on any malformed or invalid signature.
-    utxo = inp.get_utxo(idx)
+    # get_utxo indexes the FUNDING tx's outputs: the coin being spent is
+    # at the prevout's vout, not at this input's position (a vault coin
+    # at vout != input idx must not be verified against a sibling
+    # output's amount - the digest would be wrong and valid sigs refused)
+    utxo = inp.get_utxo(txi.prevout.n)
     script_code = _ser_string(wscript)
     digest = psbt.make_txn_segwit_sighash(idx, txi, utxo.nValue,
                                           script_code, SIGHASH_ALL)
