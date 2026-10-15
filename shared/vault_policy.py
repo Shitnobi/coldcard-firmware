@@ -227,6 +227,22 @@ class VaultPolicy:
             raise VaultViolation("P1: sink entry only via emergency class")
         if kind == "other":
             raise VaultViolation("not a recognized vault class")
+        # INV-SIGHASH (V-04 fix): every signature on a vault input - the
+        # partials already present AND the one this device is about to add -
+        # must commit to SIGHASH_ALL exactly. ANYONECANPAY/NONE/SINGLE
+        # signatures are graftable into transactions the policy never saw;
+        # upstream consider_dangerous_sighash never blocks ALL|ANYONECANPAY
+        # and does not review co-signer-key inputs at all, so the policy
+        # owns this invariant itself.
+        for i, inp in enumerate(view["inputs"]):
+            shs = inp.get("sighashes")
+            if shs and any(sh != 1 for sh in shs):
+                raise VaultViolation("SIGHASH: vault sigs must be "
+                                     "SIGHASH_ALL (input %d)" % i)
+            sht = inp.get("sighash_type")
+            if sht is not None and sht != 1:
+                raise VaultViolation("SIGHASH: input %d declares "
+                                     "non-ALL sighash type" % i)
         # All vault classes commit nLockTime == 0 (REV3 5.3). CSV ladder txs
         # especially: locktime set + csv seq is exactly the "bad locktime"
         # shape that would let an attacker back-date pinning.
@@ -249,6 +265,7 @@ class VaultPolicy:
             raise VaultViolation("P1: dest is the pinned spk_e")
         if view["inputs"][0]["spk"] != self.spk_v:
             raise VaultViolation("P1: must spend the vault")
+        self._require_full_utxo(view, "P1")
         for i in view["inputs"]:
             if sequence_class(i["sequence"])[0] != "emergency":
                 raise VaultViolation("P1: sequence must be 0xFFFFFFFD")
@@ -256,6 +273,17 @@ class VaultPolicy:
         if not (0 < fee <= self.f0_max):
             raise VaultViolation("P1: fee out of window")
         return "emergency F=%d" % fee
+
+    def _require_full_utxo(self, view, tag):
+        # V-05 fix: fee-bearing classes (P1/P3) must not evaluate the fee
+        # window against attacker-asserted amounts. A witness_utxo-only
+        # input (no full prevout tx to txid-cross-check) is refused.
+        # Host-test fixtures carry no 'utxo_full' field (their .utxo IS
+        # the full utxo) - treated as full, matching view_from_psbt.
+        for i, inp in enumerate(view["inputs"]):
+            if inp.get("utxo_full") is False:
+                raise VaultViolation("%s: full (non-witness) UTXO required "
+                                     "on input %d" % (tag, i))
 
     def _check_ladder(self, view):
         # INV-SEQ: vault spends are cadence-committed; exactly N, height form.
@@ -280,10 +308,14 @@ class VaultPolicy:
             raise VaultViolation("P3: ceremonies are 1-in/1-out")
         if view["outputs"][0]["spk"] != self.exit_dest:
             raise VaultViolation("P3: must re-enroll to fresh spk_v'")
+        self._require_full_utxo(view, "P3")
         fee = view["inputs"][0]["value"] - view["outputs"][0]["value"]
         if not (0 < fee <= self.f0_max):
             raise VaultViolation("P3: fee out of window")
         # belt-and-braces behind the E-2 script: K1's sig must already be present
+        # (validity of that signature - DER shape, low-S, SIGHASH_ALL and
+        # the ECDSA check against the BIP-143 digest - is enforced by
+        # vault.could_sign via vault_signing.verify_input_sigs: V-03 fix)
         if not any(self.k1 in (i.get("part_sigs") or []) for i in view["inputs"]):
             raise VaultViolation("P3: K1 co-signature required")
         return "exit ceremony F=%d" % fee

@@ -244,15 +244,25 @@ ok('count stored', vault._cfg().get('lattice_count') == 5)
 # {pubkey: sig} dicts, .txn = (pos,len) proxies). These fixtures mimic
 # that shape so the real path gets host coverage too.
 class RIn:
-    def __init__(s, spk=None, val=None, seq=0xfffffffd, part=None):
+    # UPDATED for the V-05 hardening: the real path now requires either a
+    # full (non-witness) utxo - txid-cross-checked upstream - or a
+    # witness_utxo whose spk hash-matches the witness script. Fixtures
+    # default to the full-utxo form (what hostapp/vault_tree.py now
+    # emits); set full=False for the witness-utxo-only negative cases.
+    def __init__(s, spk=None, val=None, seq=0xfffffffd, part=None,
+                 full=True, wscript=None):
         s.witness_utxo = None if spk is None else (0, 1)   # blank when None
-        s.utxo = None
+        s.utxo = (0, 1) if (spk is not None and full) else None
+        s.witness_script = (0, 1) if wscript else None
+        s._ws = wscript or b''
         s._o = UTXO(spk, val) if spk is not None else None
         s.part_sigs = part or {}
         s._seq = seq
     def get_utxo(s, idx):
         assert s._o is not None, 'no utxo'
         return s._o
+    def get(s, val):
+        return s._ws if (s.witness_script and val == s.witness_script) else b''
 class RTxIn:
     def __init__(s, seq): s.nSequence = seq
 class ROut:

@@ -62,26 +62,60 @@ def _h2b(x):
 
 
 def _iter_input_utxos(psbt):
-    # Yield (spk, value) for each input's spent output. Two shapes:
+    # Yield (spk, value, verified) for each input's spent output. Two shapes:
     #  - real firmware psbtObject: utxo/witness_utxo are (pos,len) proxies
     #    into the PSBT file, so recover the CTxOut via input.get_utxo(idx)
     #    (which prefers the full non-witness utxo when present)
     #  - host-test fakes: duck-typed .utxo objects.
     # Inputs with no utxo info are skipped here; view_from_psbt refuses
     # them instead (this fn only powers the relevance sniff).
+    #
+    # V-05 fix, relevance side: 'verified' marks whether the input's spk is
+    # trustworthy: full utxo (txid-cross-checked upstream in validate()) is
+    # trusted; a witness_utxo-only input is trusted only if its witness
+    # script hashes to the claimed spk. An UNVERIFIABLE vault-shaped claim
+    # (witness-utxo-only, script/spk disagreement, or no script at all)
+    # yields verified=False so check_relevance treats it as relevant and
+    # the fail-closed policy layer judges (and refuses) it - a vault coin
+    # can no longer be hidden from the relevance gate by asserting a
+    # foreign spk or omitting the witness script.
     if hasattr(psbt, 'input_iter') and hasattr(psbt, 'output_iter'):
         for idx, txin in psbt.input_iter():
             inp = psbt.inputs[idx]
             if not (getattr(inp, 'utxo', None) or getattr(inp, 'witness_utxo', None)):
                 continue
             u = inp.get_utxo(idx)
-            yield bytes(u.scriptPubKey), u.nValue
+            yield bytes(u.scriptPubKey), u.nValue, _spk_verified(inp)
     else:
         for inp in psbt.inputs:
             u = getattr(inp, 'utxo', None)
             if u is None:
                 continue
-            yield bytes(u.scriptPubKey), getattr(u, 'nValue', None)
+            yield bytes(u.scriptPubKey), getattr(u, 'nValue', None), True
+
+
+def _spk_verified(inp):
+    # Is this input's claimed spk trustworthy for relevance purposes?
+    # - full (non-witness) utxo present: yes (txid checked upstream)
+    # - witness_utxo only: yes iff sha256(witness_script) == spk[2:34]
+    # - anything else: no
+    if getattr(inp, 'utxo', None):
+        return True
+    ws = getattr(inp, 'witness_script', None)
+    if not ws:
+        return False
+    try:
+        from uhashlib import sha256
+    except ImportError:
+        from hashlib import sha256
+    try:
+        script = inp.get(ws)
+        # read the witness utxo spk (idx-independent: the (pos,len) proxy
+        # points at one CTxOut)
+        u = inp.get_utxo(0)
+        return sha256(script).digest() == bytes(u.scriptPubKey)[2:34]
+    except Exception:
+        return False
 
 
 def check_relevance(psbt, cfg):
@@ -95,9 +129,13 @@ def check_relevance(psbt, cfg):
         spk_v, spk_e = _h2b(cfg.get('sv_hash')), _h2b(cfg.get('spk_e'))
         if not (spk_v or spk_e):
             return False
-        for spk, val in _iter_input_utxos(psbt):
+        for spk, val, verified in _iter_input_utxos(psbt):
             if (spk_v and spk == spk_v) \
                     or (spk_e and spk == spk_e):
+                return True
+            if not verified:
+                # unverifiable spk claim: could be a hidden vault coin,
+                # fail closed - let the policy layer judge it
                 return True
     except Exception:
         return True     # odd shape: treat as relevant, policy will judge
@@ -119,11 +157,41 @@ def view_from_psbt(psbt):
                 raise VaultViolation('missing witness_utxo')
             u = inp.get_utxo(idx)
             part = getattr(inp, 'part_sigs', None)
+            # V-05 fix: mark amount provenance; a witness_utxo-only input
+            # is never txid-validated upstream, so fee-bearing classes
+            # (P1/P3) refuse it (see VaultPolicy._require_full_utxo).
+            # Also fail closed when the claimed spk disagrees with the
+            # witness script hash (relevance-side check mirrors this).
+            utxo_full = bool(getattr(inp, 'utxo', None))
+            if not utxo_full:
+                ws = getattr(inp, 'witness_script', None)
+                if not ws:
+                    raise VaultViolation('witness-utxo input missing '
+                                         'witness script')
+                if not _spk_verified(inp):
+                    raise VaultViolation('witness_utxo spk does not match '
+                                         'witness script')
+            # V-03/V-04 fix material: carry the raw sig bytes (for sighash
+            # typing + ECDSA verification in could_sign) and the PSBT-
+            # declared sighash type for this input
+            sig_data, sighashes = {}, []
+            for pk, ref in (part or {}).items():
+                sig = inp.get(ref) if isinstance(ref, (tuple, list)) else ref
+                sig_data[bytes(pk)] = bytes(sig)
+                if len(sig):
+                    sighashes.append(sig[-1])
+            sht = getattr(inp, 'sighash', None)
+            if sht is None:
+                sht = 1     # implicit SIGHASH_ALL per BIP-174
             view['inputs'].append({
                 'spk': bytes(u.scriptPubKey),
                 'value': u.nValue,
                 'sequence': seqs.get(idx),
                 'part_sigs': list(part) if part else [],
+                'sig_data': sig_data,
+                'sighashes': sighashes,
+                'sighash_type': sht,
+                'utxo_full': utxo_full,
             })
         for idx, txo in psbt.output_iter():
             # carry psbt.outputs[idx].is_change (set by consider_outputs
@@ -161,12 +229,43 @@ def could_sign(cfg, psbt):
     # Policy entry used by auth.py. Returns (approve, msg); never raises:
     # failures collapse to (False, reason).
     try:
-        desc = VaultPolicy(cfg).check(view_from_psbt(psbt))
+        view = view_from_psbt(psbt)
+        # V-03 fix: cryptographically verify every partial signature on
+        # vault-relevant inputs (DER shape, low-S, SIGHASH_ALL byte, and
+        # the ECDSA check against the BIP-143 digest of THIS transaction).
+        # Presence-only checking (the audit's V-03) let garbage blobs pass
+        # policy; finalize() would then ship them in the final witness.
+        _verify_vault_partials(cfg, psbt, view)
+        desc = VaultPolicy(cfg).check(view)
         return True, desc
     except VaultViolation as e:
         return False, str(e)
     except Exception as e:
         return False, 'vault policy error: %s' % (e,)
+
+
+def _verify_vault_partials(cfg, psbt, view):
+    # Real-psbtObject shape only: host-test fakes carry no BIP-143
+    # machinery (their part_sigs are pubkey lists; the pure policy layer
+    # covers them). For each vault/sink-relevant input, verify every
+    # partial signature. Raises VaultViolation; returns silently when
+    # nothing to check.
+    if not hasattr(psbt, 'make_txn_segwit_sighash'):
+        return
+    pol = VaultPolicy(cfg)
+    relevant = [pol.spk_v, pol.spk_e]
+    import vault_signing as vs
+    for idx, txi in psbt.input_iter():
+        inp = psbt.inputs[idx]
+        if not getattr(inp, 'has_utxo', lambda: False)():
+            continue
+        u = inp.get_utxo(idx)
+        if bytes(u.scriptPubKey) not in relevant:
+            continue
+        ws = getattr(inp, 'witness_script', None)
+        if not ws:
+            raise VaultViolation('vault input %d: missing witness script' % idx)
+        vs.verify_input_sigs(psbt, idx, inp, txi, inp.get(ws))
 
 
 def vault_log(msg, logfile=VAULT_LOG):
