@@ -643,3 +643,42 @@ logic 29/29, GUI smoke 15/15, GUI real-tkinter 17/17 (real clicks,
 clipboard, mainloop), sim e2e 19/19 on a hostapp-built tree, firmware
 policy 11/11, firmware sim e2e 25/25; `vault_policy.py` verified
 byte-identical across repos.
+
+## (n) Host app audit round 2: HA-1..HA-13 fixed in both repos
+
+Session 2026-10-15 (cont). A second audit of the host app (post-GUI,
+post-leaf-fix), every finding red-first reproduced, every fix
+regression-tested:
+
+- **HA-1/HA-2 (GUI silent failures)**: duplicate-pubkey policies
+  raised a bare `VaultViolation` and truncated PSBTs a bare
+  `struct.error` - neither in the GUI error handlers, so Build died
+  silently in the Tk callback. `run_build` now wraps every failure as
+  `HostappError`.
+- **HA-3 (BIP-174)**: duplicate keys within a PSBT map were accepted;
+  a duplicated `0x01` witness-utxo key double-counted `total_in`
+  (built vault value inflated 2x). `parse_psbt` refuses duplicates.
+- **HA-4 (fund availability)**: dust leaf ladders (< 546 sats output,
+  the device W-04 floor) enrolled fine but could never be co-signed.
+  `build_tree` refuses dust vault values / dust ladders up front.
+- **HA-5**: stale `emg*.psbt` files from a previous larger build
+  survived a rebuild in the same outdir (valid spends, absent from
+  manifest + lattice root). Rebuilds now clean prior artifacts + warn.
+- **HA-6**: failed GUI rebuilds kept the old lattice root on screen;
+  results cleared + Copy Lattice Root disabled on failure.
+- **HA-7/HA-8**: deposit-fee min-relay warning; deposit txid committed
+  over the CLEAN serialization (stray witness markers can no longer
+  corrupt the outpoint the leaves spend).
+- **HA-9/HA-10/HA-11/HA-13**: CLI policy validation without
+  tracebacks; JSON-null fields; file-vs-paste funding conflicts;
+  missing-witness-utxo preview hint; clipboard persistence;
+  exception-based validation surviving `python -O`.
+
+The standalone repo (Shitnobi/coldcard-vault-hostapp @ 1f687d5) is the
+canonical copy; `hostapp/vault_tree.py` here was re-synced to it
+(only header/sys.path wiring differs, for the firmware tree layout)
+and `testing/test_vault_hostapp.py` re-synced the same way (135
+checks, up from 113). Battery on this tree: hostapp 135/135, policy
+11/11, glue 89/89, hardening 43/43, sim e2e 25/25; device sim e2e
+19/19 against a tree built by the FIXED standalone host app (lattice
+root unchanged: 1c8b7fc2...).

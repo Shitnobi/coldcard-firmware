@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # (c) Copyright 2026 for the vault co-sign policy work; license per COPYING-CC.
 #
-# hostapp/vault_tree.py - very basic host side of the vault protocol.
+# hostapp/vault_tree.py - the host side of the vault protocol (CLI).
+# (The GUI front end lives in the standalone host-app repo.)
 #
 # Accepts a FUNDING PSBT in one of three shapes:
 #   1. "just the input": one or more inputs (witness utxos) and no outputs
@@ -27,12 +28,21 @@
 import os, sys, json, hashlib, struct, argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# APPEND (not prepend) shared/ so firmware shims there (random.py etc.)
-# never shadow CPython stdlib modules on the host
+# vault_policy.py is the pure policy/rule core in shared/ (the same
+# module the device firmware runs - host and device agree by
+# construction). APPEND (not prepend) shared/ so firmware shims there
+# (random.py etc.) never shadow CPython stdlib modules on the host.
 sys.path.append(os.path.join(HERE, '..', 'shared'))
 import vault_policy as vp
 
 SEQ_EMERGENCY = vp.SEQ_EMERGENCY
+
+
+class HostappError(SystemExit):
+    # Fatal, user-facing error. Subclasses SystemExit so the CLI keeps
+    # its exact historical behavior (message to stderr, exit code 1,
+    # 'except SystemExit' in tests) while the GUI can catch it.
+    pass
 
 
 # ---- minimal host-side PSBT / tx codec (BIP-174 v0, witness-utxo form) ---
@@ -53,7 +63,8 @@ def read_vi(b, p):
         return c, p
     if c == 253:
         return struct.unpack('<H', b[p:p + 2])[0], p + 2
-    assert c == 0xfe, 'varint too large'
+    if c != 0xfe:
+        raise HostappError('varint too large for this basic app')
     return struct.unpack('<I', b[p:p + 4])[0], p + 4
 
 
@@ -70,7 +81,8 @@ def parse_tx(b):
         txid, n = b[p:p + 32], struct.unpack('<I', b[p + 32:p + 36])[0]
         p += 36
         slen, p = read_vi(b, p)
-        assert slen == 0, 'scriptSig not empty in unsigned tx'
+        if slen != 0:
+            raise HostappError('scriptSig not empty in unsigned tx')
         seq = struct.unpack('<I', b[p:p + 4])[0]
         p += 4
         ins.append((txid, n, seq))
@@ -102,28 +114,20 @@ def txid_of(raw_tx):
 
 def parse_psbt(blob):
     # Returns {tx: bytes, in_maps: [raw input-map bytes], wutxos: [(spk,val)]}
-    assert blob[:5] == b'psbt\xff', 'not a PSBT'
+    #
+    # Audit #2 hardening:
+    #   HA-3: BIP-174 forbids duplicate keys within a map. A duplicated
+    #     0x01 witness-utxo key used to be read twice, inflating total_in
+    #     (and so the built vault value). Duplicate keys are now refused.
+    #   HA-2/HA-13: structural failures raise HostappError (not assert),
+    #     so malformed input is refused even under 'python -O' and the
+    #     GUI can surface it as a dialog instead of dying silently.
+    if blob[:5] != b'psbt\xff':
+        raise HostappError('not a PSBT (missing magic)')
     p = 5
     tx = None
-    while True:                                   # globals map
-        ks, p = read_vi(blob, p)
-        if ks == 0:
-            break
-        key = blob[p:p + ks]
-        p += ks
-        vs, p = read_vi(blob, p)
-        val = blob[p:p + vs]
-        p += vs
-        if key == b'\x00':
-            assert tx is None, 'duplicate UNSIGNED_TX'
-            tx = val
-    assert tx is not None, 'no UNSIGNED_TX in globals'
-    _, ins, outs, _ = parse_tx(tx)
-
-    in_maps, wutxos = [], []
-    for _ in range(len(ins)):                     # one map per input
-        start = p
-        while True:
+    try:
+        while True:                               # globals map
             ks, p = read_vi(blob, p)
             if ks == 0:
                 break
@@ -132,26 +136,63 @@ def parse_psbt(blob):
             vs, p = read_vi(blob, p)
             val = blob[p:p + vs]
             p += vs
-            if key == b'\x01':                    # PSBT_IN_WITNESS_UTXO
-                # BIP-174: this key has no key data; keys of the form
-                # '01 <data>' are unknown keys (passed through verbatim
-                # via in_maps) and must NOT be read as utxos.
-                # CTxOut: value LE64 + varstring spk
-                v = struct.unpack('<q', val[:8])[0]
-                slen, q = read_vi(val, 8)
-                wutxos.append((val[q:q + slen], v))
-        in_maps.append(blob[start:p])
+            if key == b'\x00':
+                if tx is not None:
+                    raise HostappError('duplicate UNSIGNED_TX in globals')
+                tx = val
+        if tx is None:
+            raise HostappError('no UNSIGNED_TX in globals')
+        _, ins, outs, _ = parse_tx(tx)
 
-    for _ in range(len(outs)):                    # one map per output
-        while True:
-            ks, p = read_vi(blob, p)
-            if ks == 0:
-                break
-            p += ks
-            vs, p = read_vi(blob, p)
-            p += vs
+        in_maps, wutxos = [], []
+        for mi in range(len(ins)):                 # one map per input
+            start = p
+            seen = set()
+            while True:
+                ks, p = read_vi(blob, p)
+                if ks == 0:
+                    break
+                key = blob[p:p + ks]
+                p += ks
+                if key in seen:
+                    raise HostappError('duplicate key %s in input map %d '
+                                       '(BIP-174 forbids duplicate map '
+                                       'keys)' % (key.hex(), mi))
+                seen.add(key)
+                vs, p = read_vi(blob, p)
+                val = blob[p:p + vs]
+                p += vs
+                if key == b'\x01':                 # PSBT_IN_WITNESS_UTXO
+                    # BIP-174: this key has no key data; keys of the form
+                    # '01 <data>' are unknown keys (passed through verbatim
+                    # via in_maps) and must NOT be read as utxos.
+                    # CTxOut: value LE64 + varstring spk
+                    v = struct.unpack('<q', val[:8])[0]
+                    slen, q = read_vi(val, 8)
+                    wutxos.append((val[q:q + slen], v))
+            in_maps.append(blob[start:p])
 
-    assert p == len(blob), 'PSBT map count/length mismatch'
+        for oi in range(len(outs)):                # one map per output
+            seen = set()
+            while True:
+                ks, p = read_vi(blob, p)
+                if ks == 0:
+                    break
+                key = blob[p:p + ks]
+                p += ks
+                if key in seen:
+                    raise HostappError('duplicate key %s in output map %d '
+                                       '(BIP-174 forbids duplicate map '
+                                       'keys)' % (key.hex(), oi))
+                seen.add(key)
+                vs, p = read_vi(blob, p)
+                p += vs
+    except (IndexError, struct.error) as e:
+        # truncated / short-read blobs (HostappError is SystemExit and
+        # never caught here)
+        raise HostappError('malformed PSBT (truncated): %s' % e)
+    if p != len(blob):
+        raise HostappError('PSBT map count/length mismatch')
     return {'tx': tx, 'in_maps': in_maps, 'wutxos': wutxos,
             'ins': ins, 'outs': outs}
 
@@ -181,7 +222,7 @@ def push_num(n):
     # NOTE: parse_vault_script requires a data push (not OP_1..OP_16), so
     # N <= 16 is intentionally encoded non-minimally.
     if not (1 <= n <= 0xFFFF):
-        raise SystemExit('ERROR: cadence N must be in 1..65535, got %d' % n)
+        raise HostappError('ERROR: cadence N must be in 1..65535, got %d' % n)
     payload = n.to_bytes((n.bit_length() + 7) // 8, 'little')
     if payload[-1] & 0x80:
         payload += b'\x00'        # keep the script-num positive
@@ -217,7 +258,7 @@ def cfg_from_policy(pol, s_v, s_e):
     if ex:
         b = bytes.fromhex(ex)
         if len(b) != 34 or b[:2] != b'\x00\x20':
-            raise SystemExit(
+            raise HostappError(
                 'ERROR: exit_spk must be a P2WSH scriptPubKey '
                 '(34 bytes: OP_0 PUSH32 <hash>), got %d-byte spk %s'
                 % (len(b), ex))
@@ -235,14 +276,22 @@ def cfg_from_policy(pol, s_v, s_e):
 
 # ---- the app ---------------------------------------------------------------
 
-def load_funding(path, spk_v, deposit_fee):
-    # Accept, classify and normalize the funding PSBT. Returns
-    # (mode, tx_bytes, in_maps, vault_value, total_in, vault_vout).
-    blob = open(path, 'rb').read()
+def load_funding(funding, spk_v, deposit_fee):
+    # Accept, classify and normalize the funding PSBT. `funding` is a
+    # file path (str) or the raw PSBT bytes (e.g. decoded from pasted
+    # hex/base64 by the GUI). Returns
+    # (mode, tx_bytes, in_maps, vault_value, total_in, vault_vout,
+    #  warnings) - warnings is a list of human-readable strings the
+    # caller (CLI print / GUI display) surfaces to the user.
+    blob = open(funding, 'rb').read() if isinstance(funding, str) else funding
     ps = parse_psbt(blob)
-    assert ps['wutxos'], 'funding PSBT needs witness utxos'
+    warnings = []
+    if not ps['wutxos']:
+        raise HostappError('ERROR: funding PSBT needs witness utxos')
     total_in = sum(v for _, v in ps['wutxos'])
-    assert total_in > deposit_fee, 'funding value <= deposit fee'
+    if total_in <= deposit_fee:
+        raise HostappError('ERROR: funding value (%d) <= deposit fee (%d)'
+                           % (total_in, deposit_fee))
     version, ins, outs, locktime = parse_tx(ps['tx'])
 
     match = [i for i, (spk, val) in enumerate(outs) if spk == spk_v]
@@ -255,14 +304,14 @@ def load_funding(path, spk_v, deposit_fee):
         if len(match) != 1:
             # ambiguous: only one output may pay S_v (which one is the
             # deposit?); refuse rather than guess
-            raise SystemExit('ERROR: %d outputs pay S_v (expected exactly '
-                             'one); ambiguous funding refused' % len(match))
+            raise HostappError('ERROR: %d outputs pay S_v (expected exactly '
+                               'one); ambiguous funding refused' % len(match))
         if outs[match[0]][1] != total_in - deposit_fee:
             mode = 'incorrect-output'
         elif sum(v for _, v in outs) > total_in:
-            raise SystemExit('ERROR: funding outputs (%d sats) exceed '
-                             'inputs (%d sats)' %
-                             (sum(v for _, v in outs), total_in))
+            raise HostappError('ERROR: funding outputs (%d sats) exceed '
+                               'inputs (%d sats)' %
+                               (sum(v for _, v in outs), total_in))
         else:
             mode = 'already-correct'
             vault_vout = match[0]
@@ -270,31 +319,86 @@ def load_funding(path, spk_v, deposit_fee):
         mode = 'incorrect-output'
 
     if mode == 'already-correct':
-        tx_bytes = ps['tx']
+        # HA-8 (audit #2): commit to the CLEAN serialization of the
+        # funding tx, not the raw global-tx bytes. A non-compliant
+        # producer that left a witness marker/flag in the global tx
+        # would otherwise yield a wrong txid (txid excludes marker and
+        # witness data) and every leaf would spend a nonexistent
+        # outpoint. Byte-identical to ps['tx'] for compliant PSBTs.
+        tx_bytes = ser_tx(version, ins, outs, locktime)
         vault_value = outs[match[0]][1]
     else:
         if mode == 'incorrect-output':
-            print('WARNING: funding output does not pay S_v with value '
-                  'funding-fee; REPLACING all outputs (incl. any change) '
-                  'with the vault deposit')
+            warnings.append(
+                'funding output does not pay S_v with value '
+                'funding-fee; REPLACING all outputs (incl. any change) '
+                'with the vault deposit')
         vault_value = total_in - deposit_fee
         tx_bytes = ser_tx(version, ins, [(spk_v, vault_value)], locktime)
-    return mode, tx_bytes, ps['in_maps'], vault_value, total_in, vault_vout
+    return (mode, tx_bytes, ps['in_maps'], vault_value, total_in,
+            vault_vout, warnings)
 
 
 def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
                emg_fee, emg_step):
+    # Build the full vault tree (deposit + emergency lattice + manifest)
+    # and return a report dict for the caller to render (CLI prints it,
+    # the GUI shows it in the results pane). `funding_path` is a file
+    # path or raw PSBT bytes.
     s_v, s_e = build_scripts(pol)
     spk_v, spk_e = vp.p2wsh_spk(s_v), vp.p2wsh_spk(s_e)
     cfg = cfg_from_policy(pol, s_v, s_e)
 
-    mode, dep_tx, in_maps, vault_value, total_in, vault_vout = load_funding(
-        funding_path, spk_v, deposit_fee)
+    (mode, dep_tx, in_maps, vault_value, total_in, vault_vout, warnings
+     ) = load_funding(funding_path, spk_v, deposit_fee)
+
+    # HA-4 (audit #2): dust floor. The device's W-04 check refuses to
+    # co-sign any output below DUST_LIMIT - at SPEND time, long after
+    # enrollment. Refuse here instead, so a dust ladder can never be
+    # built+enrolled only to be discovered dead when it is needed.
+    hi_fee = emg_fee + (leaves - 1) * emg_step
+    if vault_value < vp.DUST_LIMIT:
+        raise HostappError(
+            'ERROR: vault value %d sats is below the dust limit %d - '
+            'the deposit output would be non-standard' %
+            (vault_value, vp.DUST_LIMIT))
+    if vault_value - hi_fee < vp.DUST_LIMIT:
+        raise HostappError(
+            'ERROR: highest-fee leaf output %d sats is below the dust '
+            'limit %d (vault %d - fee %d); the device would refuse to '
+            'co-sign it - lower the emergency fees or fund more' %
+            (vault_value - hi_fee, vp.DUST_LIMIT, vault_value, hi_fee))
+
+    os.makedirs(outdir, exist_ok=True)
+    # HA-5 (audit #2): remove stale artifacts from a previous (e.g.
+    # larger) build in this outdir. Leftover emg*.psbt files are absent
+    # from the new manifest and NOT covered by the new lattice root,
+    # but remain policy-valid spends a user could still pick at
+    # enrollment. Only our own output names are touched.
+    stale = sorted(
+        f for f in os.listdir(outdir)
+        if f in ('deposit.psbt', 'manifest.json') or
+        (f.startswith('emg') and f.endswith('.psbt')))
+    for f in stale:
+        os.remove(os.path.join(outdir, f))
+    if stale:
+        warnings.append('removed %d stale file(s) from a previous build: '
+                        '%s' % (len(stale), ', '.join(stale)))
 
     # deposit.psbt: funding -> S_v (input maps carried over verbatim; one
     # output map per output of the deposit tx)
-    os.makedirs(outdir, exist_ok=True)
     version, dep_ins, dep_outs, locktime = parse_tx(dep_tx)
+    # HA-7 (audit #2): min-relay floor on the deposit fee, mirroring the
+    # device-side _min_relay_fee conservatism. Only meaningful in the
+    # modes where WE fix the deposit's fee (already-correct funding
+    # carries the funder's own implicit fee).
+    if mode != 'already-correct':
+        floor = 100 + 70 * len(dep_ins) + 45 * len(dep_outs)
+        if deposit_fee < floor:
+            warnings.append(
+                'deposit fee %d sats is below a conservative min-relay '
+                'floor of %d for a %d-input deposit; the signed deposit '
+                'may not relay' % (deposit_fee, floor, len(dep_ins)))
     deposit = build_psbt(dep_tx, in_maps, len(dep_outs))
     open(os.path.join(outdir, 'deposit.psbt'), 'wb').write(deposit)
 
@@ -310,9 +414,12 @@ def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
     leaf_w = len(str(leaves - 1)) if leaves > 1 else 1
     for i in range(leaves):
         fee = emg_fee + i * emg_step
-        assert 0 < fee <= pol['f0_max'], \
-            'emg fee %d outside (0, f0_max=%d]' % (fee, pol['f0_max'])
-        assert fee < vault_value, 'emg fee >= vault value'
+        if not (0 < fee <= pol['f0_max']):
+            raise HostappError('ERROR: emg fee %d outside (0, f0_max=%d]'
+                               % (fee, pol['f0_max']))
+        if fee >= vault_value:
+            raise HostappError('ERROR: emg fee %d >= vault value %d'
+                               % (fee, vault_value))
         # vault txs commit nLockTime == 0 (REV3 5.3) - not inherited
         # from the funding tx
         tx = ser_tx(version, [(dep_txid, vault_vout, SEQ_EMERGENCY)],
@@ -357,20 +464,49 @@ def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
     open(os.path.join(outdir, 'manifest.json'), 'w').write(
         json.dumps(manifest, indent=1))
 
-    print('funding mode:     %s' % mode)
-    print('funding value:    %d sats' % total_in)
+    return {
+        'warnings': warnings,
+        'funding_mode': mode,
+        'funding_value': total_in,
+        'vault_value': vault_value,
+        'deposit_fee': deposit_fee,
+        'vault_vout': vault_vout,
+        'deposit_txid': manifest['deposit_txid'],
+        'lattice_count': count,
+        'leaf_files': files,
+        'emg_fee': emg_fee,
+        'emg_step': emg_step,
+        'lattice_root': root.hex(),
+        'spk_v': spk_v.hex(),
+        'spk_e': spk_e.hex(),
+        'outdir': os.path.abspath(outdir),
+        'manifest_path': os.path.abspath(
+            os.path.join(outdir, 'manifest.json')),
+    }
+
+
+def print_report(rep):
+    # CLI rendering of a build_tree() report (same lines as the
+    # historical output, plus any funding warnings surfaced first)
+    for w in rep['warnings']:
+        print('WARNING: %s' % w)
+    print('funding mode:     %s' % rep['funding_mode'])
+    print('funding value:    %d sats' % rep['funding_value'])
     print('vault value:      %d sats (deposit fee %d)' %
-          (vault_value, deposit_fee))
-    print('vault vout:       %d' % vault_vout)
-    print('deposit txid:     %s' % manifest['deposit_txid'])
+          (rep['vault_value'], rep['deposit_fee']))
+    print('vault vout:       %d' % rep['vault_vout'])
+    print('deposit txid:     %s' % rep['deposit_txid'])
     print('lattice:          %d emergency leaves, fees %d..%d' %
-          (count, emg_fee, emg_fee + (leaves - 1) * emg_step))
+          (rep['lattice_count'], rep['emg_fee'],
+           rep['emg_fee'] + (len(rep['leaf_files']) - 1) * rep['emg_step']))
+    leaf_w = len(str(len(rep['leaf_files']) - 1)) \
+        if len(rep['leaf_files']) > 1 else 1
     print('leaf files:       emg%0*d.psbt .. emg%0*d.psbt (fixed width: '
           'file-picker sort order == leaf order; ENROLL IN THAT ORDER)'
-          % (leaf_w, 0, leaf_w, leaves - 1))
-    print('lattice root:     %s' % root.hex())
+          % (leaf_w, 0, leaf_w, len(rep['leaf_files']) - 1))
+    print('lattice root:     %s' % rep['lattice_root'])
     print('wrote %d emg PSBTs + deposit.psbt + manifest.json to %s' %
-          (count, outdir))
+          (rep['lattice_count'], rep['outdir']))
 
 
 def init_policy(path, random_keys):
@@ -400,11 +536,61 @@ def init_policy(path, random_keys):
     print('wrote sample policy to %s' % path)
 
 
-def load_policy(path):
-    d = json.loads(open(path).read())
+def validate_policy(pol):
+    # HA-9 (audit #2): reject a malformed policy with a clear message
+    # instead of a KeyError/ValueError traceback, BEFORE any output is
+    # written. Optional ladder knobs default to the CLI defaults; the
+    # structural script checks (duplicate-pubkey quorum collapse etc.)
+    # run through the same parser the device uses.
     for k in ('k1', 'k2', 'k3'):
-        d[k] = bytes.fromhex(d[k])
-    return d
+        b = pol.get(k)
+        if not isinstance(b, bytes) or len(b) != 33 or b[0] not in (0x02,
+                                                                    0x03):
+            raise HostappError('ERROR: policy field %s must be a 33-byte '
+                               'compressed pubkey (02/03 + 32 bytes)' % k)
+    n = pol.get('n')
+    if not isinstance(n, int) or not (1 <= n <= 0xFFFF):
+        raise HostappError('ERROR: policy field n (cadence) must be an '
+                           'integer in 1..65535')
+    f0 = pol.get('f0_max')
+    if not isinstance(f0, int) or f0 <= 0:
+        raise HostappError('ERROR: policy field f0_max must be a positive '
+                           'integer')
+    leaves = pol.get('leaves', 5)
+    emg_fee = pol.get('emg_fee', 500)
+    emg_step = pol.get('emg_step', 13)
+    for k, v, lo in (('leaves', leaves, 1), ('emg_fee', emg_fee, 1),
+                     ('emg_step', emg_step, 0)):
+        if not isinstance(v, int) or v < lo:
+            raise HostappError('ERROR: policy field %s must be an integer '
+                               '>= %d' % (k, lo))
+    hi = emg_fee + (leaves - 1) * emg_step
+    if hi > f0:
+        raise HostappError('ERROR: highest emergency leaf fee (%d) exceeds '
+                           'f0_max (%d)' % (hi, f0))
+    try:
+        build_scripts(pol)
+    except vp.VaultViolation as e:
+        raise HostappError('ERROR: policy refused: %s' % e)
+    return pol
+
+
+def load_policy(path):
+    try:
+        d = json.loads(open(path).read())
+    except OSError as e:
+        raise HostappError('ERROR: cannot read policy %s: %s' % (path, e))
+    except ValueError as e:
+        raise HostappError('ERROR: policy %s is not valid JSON: %s'
+                           % (path, e))
+    if not isinstance(d, dict):
+        raise HostappError('ERROR: policy %s is not a JSON object' % path)
+    for k in ('k1', 'k2', 'k3'):
+        try:
+            d[k] = bytes.fromhex(d[k])
+        except (KeyError, ValueError, TypeError):
+            raise HostappError('ERROR: policy field %s: not valid hex' % k)
+    return validate_policy(d)
 
 
 def main():
@@ -430,13 +616,13 @@ def main():
         init_policy(a.path, a.random_keys)
         return
     pol = load_policy(a.policy)
-    build_tree(pol, a.funding, a.outdir,
+    print_report(build_tree(pol, a.funding, a.outdir,
                a.deposit_fee if a.deposit_fee is not None
                else pol.get('deposit_fee', 500),
                a.leaves if a.leaves is not None else pol.get('leaves', 5),
                a.emg_fee if a.emg_fee is not None else pol.get('emg_fee', 500),
                a.emg_step if a.emg_step is not None
-               else pol.get('emg_step', 13))
+               else pol.get('emg_step', 13)))
 
 
 if __name__ == '__main__':
