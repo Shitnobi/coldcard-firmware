@@ -7,14 +7,14 @@
   "f0_max": 10000,
   "exit_spk": "002070d55c414b1ee51c25b0657c1b97583aaafc2bc40d2b53c6de9c237b5caee139"
  },
- "lattice_root": "a414a85700ea50dca283cb1ae3fcf363ac635126677f5427bfa0f407867ea98e",
+ "lattice_root": "9facf7afae13f49e275f7bdab4d6db3e7e407e680946d17ff05c20e845757e74",
  "lattice_count": 5,
  "funding_mode": "input-only",
  "funding_value": 100000,
  "deposit_fee": 500,
  "vault_value": 99500,
  "vault_vout": 0,
- "deposit_txid": "976a1d0a4c5c49f0d70a4fb40c3707667b2bd827c321424186a4373494795174",
+ "deposit_txid": "77d7fd471e3996fe65f180511bde86abb345547528d4ebf3b486494172775024",
  "files": [
   "emg0.psbt",
   "emg1.psbt",

@@ -767,3 +767,51 @@ B already-correct / C multi-input+ladder / D GUI parity), 90/90
 checks. One driver bug found and fixed during the run (BIP-174
 output-map count: a 2-output funding PSBT needs two empty output
 maps; Core's walletprocesspsbt caught it - TX decode failed).
+
+## (q) P3 exit ceremony: the last spend class proven on-chain
+
+Coverage audit round 3 (follow-on to (p)): enumerate every gate
+spend class and check each has an ON-CHAIN co-sign+broadcast+mine
+proof against a real hostapp deposit. P1 emergency (flow A/B) and
+P2 ladder (flow C) were proven; **P3 exit was not**: vault_e2e_gen's
+exit.psbt covers the gate level only (could_sign approval with a
+real K1 partial signature), and no exit ceremony had ever been
+co-signed by the device and accepted by consensus.
+
+New flow E in vault_hostapp_regtest.py (firmware copy):
+
+1. The policy carries an EXPLICIT exit_spk (P2WSH 1-of-1 K1,
+   distinct from the hostapp's default 3-key sink-shape) - verified
+   to flow through policy.json -> manifest cfg -> device enrollment.
+2. A normal deposit -> emergency-spend cycle leaves a REAL confirmed
+   spk_e coin (99000 sats) on-chain.
+3. A HOST-CONSTRUCTED exit ceremony spends that coin: 1-in/1-out
+   paying exit_spk, nSequence 0xFFFFFFFD, full UTXO + witness utxo +
+   S_e witness script + K1 partial signature over the S_e BIP-143
+   digest in the input map (same construction pattern as flow C's
+   ladder, but over S_e).
+4. The device co-signs it through the FULL firmware chain
+   (vault_hostapp_cosign.py: enroll -> validate -> consider_* ->
+   VaultMode.could_sign -> sign_it -> finalize): the first live
+   exercise of the 'se' input path (psbt.py _classify_vault_input
+   kind 'se', vault_signing.build_witness -> [dummy, sig_K2,
+   sig_K1, S_e]) and of _verify_vault_partials on a real S_e input
+   outside the generator trees.
+5. Host-side verification (BIP-143 both signatures, S_e witness
+   order, sha256(S_e) == spk_e[2:]), testmempoolaccept, broadcast,
+   mine: the spk_e coin is SPENT on-chain and the exit output pays
+   the explicit exit_spk (98500 sats).
+6. Two gate negatives through the real device chain: an exit paying
+   a WRONG destination is refused ('P3: must re-enroll to fresh
+   spk_v'') and an exit WITHOUT the K1 co-signature is refused
+   ('P3: K1 co-signature required').
+
+vault_hostapp_regtest.py is now five flows, 112/112 checks (was
+90/90; +22 for flow E). Repo sync 7/7, hostapp battery 135/135,
+policy battery PASS, sim e2e 19/19 per tree. No bitcoind left
+running.
+
+Remaining deliberately-uncovered item (unchanged from (p)): the
+'incorrect-output' funding mode on-chain (classification is
+unit-tested; on-chain behavior is identical to input-only's rebuild
+path).

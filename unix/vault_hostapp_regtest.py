@@ -5,7 +5,7 @@
 # driving BOTH host apps (the standalone coldcard-vault-hostapp repo
 # AND its byte-synced firmware-repo mirror hostapp/vault_tree.py)
 # through the REAL user flow against a private bitcoind chain and the
-# REAL device simulator. Four flows:
+# REAL device simulator. Five flows:
 #
 #  A. input-only (both apps): regtest coin -> funding PSBT (input-only
 #     shape) -> hostapp builds the tree -> the regtest wallet SIGNS the
@@ -47,6 +47,21 @@
 #     and must produce byte-identical artifacts (deposit.psbt, every
 #     emg leaf, manifest.json) to the CLI build.
 #
+#  E. P3 exit ceremony (firmware copy): the policy carries an EXPLICIT
+#     exit_spk (P2WSH, distinct from the hostapp default) which must
+#     flow through the manifest into the device cfg. After a normal
+#     deposit -> emergency-spend cycle leaves a REAL confirmed spk_e
+#     coin on-chain, a HOST-CONSTRUCTED exit ceremony spending that
+#     coin (1-in/1-out paying exit_spk, K1 partial signature over the
+#     S_e BIP-143 digest) is co-signed by the device through the full
+#     firmware chain (the 'se' witness: [dummy, sig_K2, sig_K1, S_e]),
+#     host-verified, broadcast and mined: the sink coin is spent and
+#     the exit output pays the explicit exit_spk. Two gate negatives
+#     through the real chain: an exit paying the WRONG destination is
+#     refused ('P3: must re-enroll to fresh spk_v''), and an exit
+#     without the K1 co-signature is refused ('P3: K1 co-signature
+#     required').
+#
 # Requires: python-ecdsa, Bitcoin Core binaries (/tmp/bitcoin-28.0/bin
 # is prepended to PATH if present), the built coldcard-mpy.
 # Run from the repo root:  python3 unix/vault_hostapp_regtest.py
@@ -86,6 +101,7 @@ EMG_FEE = 500
 LEAVES = 5
 EMG_STEP = 13
 LADDER_FEE = 500
+EXIT_FEE = 500
 OPRET = b'\x6a\x04e2e!'            # 0-value data output (standard)
 
 APPS = [
@@ -215,6 +231,9 @@ def verify_cosigned(signed, ctx, dep_txid_disp, vout, vault_value, fee,
     if spend == 'ladder':
         seq_want, sel_want = int(ctx['n']), b'\x01'
         out_want = bytes(dest_spk)
+    elif spend == 'exit':
+        seq_want, sel_want = 0xFFFFFFFD, None
+        out_want = bytes(dest_spk)
     else:
         seq_want, sel_want = 0xFFFFFFFD, b''
         out_want = bytes.fromhex(ctx['spk_e'])
@@ -237,17 +256,30 @@ def verify_cosigned(signed, ctx, dep_txid_disp, vout, vault_value, fee,
           t['out_spk'] == out_want)
     check('output value = vault_value - fee',
           t['out_val'] == vault_value - fee)
-    check('witness = [dummy, sig, sig, selector, script]',
-          len(t['stack']) == 5 and t['stack'][0] == b'' and
-          t['stack'][3] == sel_want)
-    check('branch selector is the %s branch' % spend,
-          t['stack'][3] == sel_want)
-    check('witness script is the hostapp S_v', t['stack'][4] == S_V)
-    check('sha256(S_v) == spk_v[2:]',
-          hashlib.sha256(S_V).digest() ==
-          bytes.fromhex(ctx['spk_v'])[2:])
+    if spend == 'exit':
+        # S_e witness: [dummy, sig_other, sig_K1, script] (build_witness
+        # kind 'se': K1's signature is the TOPMOST signature)
+        S_W = bytes.fromhex(ctx['s_e'])
+        check('witness = [dummy, sig_other, sig_K1, script]',
+              len(t['stack']) == 4 and t['stack'][0] == b'' and
+              t['stack'][3] == S_W)
+        check('witness script is the enrolled S_e', t['stack'][3] == S_W)
+        check('sha256(S_e) == spk_e[2:]',
+              hashlib.sha256(S_W).digest() ==
+              bytes.fromhex(ctx['spk_e'])[2:])
+    else:
+        S_W = S_V
+        check('witness = [dummy, sig, sig, selector, script]',
+              len(t['stack']) == 5 and t['stack'][0] == b'' and
+              t['stack'][3] == sel_want)
+        check('branch selector is the %s branch' % spend,
+              t['stack'][3] == sel_want)
+        check('witness script is the hostapp S_v', t['stack'][4] == S_V)
+        check('sha256(S_v) == spk_v[2:]',
+              hashlib.sha256(S_V).digest() ==
+              bytes.fromhex(ctx['spk_v'])[2:])
 
-    script_code = bytes([len(S_V)]) + S_V
+    script_code = bytes([len(S_W)]) + S_W
     preimage = (struct.pack('<i', t['version'])
                 + dsha(t['prev_hash'] + struct.pack('<I', t['prev_n']))
                 + dsha(struct.pack('<I', t['seq']))
@@ -336,11 +368,12 @@ def wallet_sign(cli, psbt_blob, tag):
     return fin['hex']
 
 
-def write_policy(ctx, path):
+def write_policy(ctx, path, exit_spk=''):
     pol = {'k1': ctx['k1_pubkey'], 'k2': ctx['k2_pubkey'],
            'k3': ctx['k3_pubkey'], 'n': ctx['n'],
            'f0_max': ctx['f0_max'], 'leaves': LEAVES, 'emg_fee': EMG_FEE,
-           'emg_step': EMG_STEP, 'deposit_fee': DEPOSIT_FEE}
+           'emg_step': EMG_STEP, 'deposit_fee': DEPOSIT_FEE,
+           'exit_spk': exit_spk}
     open(path, 'w').write(json.dumps(pol, indent=1))
     return pol
 
@@ -423,7 +456,8 @@ def cosign_and_verify(tag, app_path, outdir, ctx, leaf_name, dep_txid_disp,
 
     rc, sim_out = run_cosign_sim(outdir, os.path.basename(k1_path))
     ok('%s: device co-signs the hostapp %s' %
-       (tag, 'leaf' if spend == 'emergency' else 'ladder spend'),
+       (tag, {'emergency': 'leaf', 'ladder': 'ladder spend',
+              'exit': 'exit ceremony'}[spend]),
        rc == 0 and 'COSIGN OK' in sim_out, sim_out[-600:])
     resp = json.load(open(os.path.join(outdir, 'cosign_response.json')))
     ok("%s: gate classified it '%s'" % (tag, spend),
@@ -434,6 +468,9 @@ def cosign_and_verify(tag, app_path, outdir, ctx, leaf_name, dep_txid_disp,
         signers = (bytes.fromhex(ctx['k2_pubkey']), user_pk) \
             if user_pk != bytes.fromhex(ctx['k1_pubkey']) else \
             (user_pk, bytes.fromhex(ctx['k2_pubkey']))
+    elif spend == 'exit':
+        # S_e witness order: sig_other (K2) beneath sig_K1
+        signers = (bytes.fromhex(ctx['k2_pubkey']), user_pk)
     else:
         signers = (user_pk, bytes.fromhex(ctx['k2_pubkey']))
     good = verify_cosigned(signed, ctx, dep_txid_disp, vout, vault_value,
@@ -695,6 +732,155 @@ def flow_multi_ladder(tag, app_path, cli, ctx, miner):
        lutxo['scriptPubKey']['hex'] == dest_spk.hex())
 
 
+# ---- flow E: P3 exit ceremony spending a REAL spk_e coin ------------------
+
+def flow_exit_ceremony(tag, app_path, cli, ctx, miner):
+    print('--- E. %s: deposit -> emergency -> P3 exit ceremony ---' % tag)
+    outdir = os.path.join(OUTROOT, 'vault_tree_' + tag.split()[0] + '_exit')
+    if os.path.isdir(outdir):
+        shutil.rmtree(outdir)
+    os.makedirs(outdir)
+
+    # an EXPLICIT exit destination (P2WSH 1-of-1 K1), distinct from the
+    # hostapp's default exit_spk: it must flow through the manifest
+    # into the device-enrolled cfg
+    k1 = bytes.fromhex(ctx['k1_pubkey'])
+    exit_script = b'\x51' + k1 + b'\x51\xac'
+    exit_spk = b'\x00\x20' + hashlib.sha256(exit_script).digest()
+
+    ftxid, vout, spk = get_coin(cli, miner, AMOUNT)
+    ftx = ser_tx(2, [(bytes.fromhex(ftxid)[::-1], vout, 0xffffffff)], [], 0)
+    im = kv(b'\x01', ct_out(bytes.fromhex(spk), AMOUNT)) + b'\x00'
+    funding = b'psbt\xff' + kv(b'\x00', ftx) + b'\x00' + im
+    fund_path = os.path.join(outdir, 'funding.psbt')
+    open(fund_path, 'wb').write(funding)
+    write_policy(ctx, os.path.join(outdir, 'policy.json'),
+                 exit_spk=exit_spk.hex())
+
+    man = build_tree(tag + '(E)', app_path, outdir,
+                     os.path.join(outdir, 'policy.json'), fund_path)
+    ok('%s(E): manifest cfg carries the EXPLICIT exit_spk' % tag,
+       man['cfg']['exit_spk'] == exit_spk.hex(),
+       man['cfg'].get('exit_spk', '')[:24])
+
+    dep_hex = wallet_sign(cli, open(os.path.join(outdir, 'deposit.psbt'),
+                                    'rb').read(), tag + '(E)')
+    dep_txid = json.loads(cli('decoderawtransaction', dep_hex))['txid']
+    ok('%s(E): signed deposit txid == manifest prediction' % tag,
+       dep_txid == man['deposit_txid'])
+    cli('sendrawtransaction', dep_hex)
+    cli('generatetoaddress', '1', miner, wallet='ora')
+    utxo = gettxout(cli, man['deposit_txid'], man['vault_vout'])
+    ok('%s(E): vault coin CONFIRMED, %d sats' % (tag, man['vault_value']),
+       utxo is not None and utxo['confirmations'] >= 1 and
+       utxo['value'] == man['vault_value'] / 1e8)
+
+    device_enroll_e2e(tag + '(E)', outdir)
+
+    # P1 first: the emergency spend leaves a REAL confirmed spk_e coin
+    emg_hex = cosign_and_verify(
+        tag + '(E)', app_path, outdir, ctx, 'emg0.psbt',
+        man['deposit_txid'], man['vault_vout'], man['vault_value'],
+        bytes([0x01] * 32), k1)
+    emg_txid = cli('sendrawtransaction', emg_hex)
+    cli('generatetoaddress', '1', miner, wallet='ora')
+    coin_val = man['vault_value'] - EMG_FEE
+    eutxo = gettxout(cli, emg_txid, 0)
+    ok('%s(E): emergency output CONFIRMED, pays spk_e, %d sats' %
+       (tag, coin_val),
+       eutxo is not None and eutxo['confirmations'] >= 1 and
+       eutxo['value'] == coin_val / 1e8 and
+       eutxo['scriptPubKey']['hex'] == ctx['spk_e'])
+
+    # P3: a HOST-CONSTRUCTED exit ceremony spending the real spk_e coin:
+    # 1-in/1-out paying the explicit exit_spk, K1 partial signature over
+    # the S_e BIP-143 digest, full UTXO + witness script S_e in the map
+    emg_txid_le = bytes.fromhex(emg_txid)[::-1]
+    S_E = bytes.fromhex(ctx['s_e'])
+    out_val = coin_val - EXIT_FEE
+    xtx = ser_tx(2, [(emg_txid_le, 0, 0xFFFFFFFD)],
+                 [(exit_spk, out_val)], 0)
+    digest = bip143_digest(2, emg_txid_le, 0, 0xFFFFFFFD, S_E, coin_val,
+                           exit_spk, out_val, 0)
+    sig = sign_with(bytes([0x01] * 32), digest)
+    import ecdsa
+    from ecdsa.util import sigdecode_der
+    vk = ecdsa.VerifyingKey.from_string(k1, curve=ecdsa.SECP256k1)
+    try:
+        vk.verify_digest(sig[:-1], digest, sigdecode=sigdecode_der)
+        ok('%s(E): host K1 exit partial sig verifies (BIP-143 over S_e)'
+           % tag, True)
+    except Exception as e:
+        ok('%s(E): host K1 exit partial sig verifies (BIP-143 over S_e)'
+           % tag, False, e)
+    origins = (kv(b'\x06' + k1, struct.pack('<I', 0x11111111)) +
+               kv(b'\x06' + bytes.fromhex(ctx['k2_pubkey']),
+                  struct.pack('<II', ctx['xfp'], 123)) +
+               kv(b'\x06' + bytes.fromhex(ctx['k3_pubkey']),
+                  struct.pack('<I', 0x33333333)))
+    im = (kv(b'\x00', bytes.fromhex(emg_hex)) +
+          kv(b'\x01', ct_out(bytes.fromhex(ctx['spk_e']), coin_val)) +
+          kv(b'\x02' + k1, sig) +
+          kv(b'\x05', S_E) + origins + b'\x00')
+    open(os.path.join(outdir, 'exit.k1.psbt'), 'wb').write(
+        b'psbt\xff' + kv(b'\x00', xtx) + b'\x00' + im + b'\x00')
+
+    exit_hex = cosign_and_verify(
+        tag + '(E)', app_path, outdir, ctx, 'exit.k1.psbt',
+        emg_txid, 0, coin_val, bytes([0x01] * 32), k1,
+        spend='exit', dest_spk=exit_spk, fee=EXIT_FEE, prebuilt=True)
+
+    acc = json.loads(cli('testmempoolaccept', '["%s"]' % exit_hex))[0]
+    ok('%s(E): testmempoolaccept allows the exit ceremony' % tag,
+       acc.get('allowed') is True, acc.get('reject-reason'))
+    exit_txid = cli('sendrawtransaction', exit_hex)
+    cli('generatetoaddress', '1', miner, wallet='ora')
+    ok('%s(E): spk_e coin SPENT on-chain by the exit ceremony' % tag,
+       gettxout(cli, emg_txid, 0) is None)
+    xutxo = gettxout(cli, exit_txid, 0)
+    ok('%s(E): exit output CONFIRMED, pays the EXPLICIT exit_spk, '
+       '%d sats' % (tag, out_val),
+       xutxo is not None and xutxo['confirmations'] >= 1 and
+       xutxo['value'] == out_val / 1e8 and
+       xutxo['scriptPubKey']['hex'] == exit_spk.hex())
+
+    # ---- gate negatives through the REAL device chain ------------------
+    # (1) exit ceremony paying the WRONG destination: the policy gate
+    #     must refuse - sink funds cannot be redirected anywhere but
+    #     the enrolled exit_spk
+    bad_addr = cli('getnewaddress', '', 'bech32', wallet='ora')
+    bad_spk = bytes.fromhex(json.loads(
+        cli('getaddressinfo', bad_addr, wallet='ora'))['scriptPubKey'])
+    btx = ser_tx(2, [(emg_txid_le, 0, 0xFFFFFFFD)],
+                 [(bad_spk, out_val)], 0)
+    bdg = bip143_digest(2, emg_txid_le, 0, 0xFFFFFFFD, S_E, coin_val,
+                        bad_spk, out_val, 0)
+    bsig = sign_with(bytes([0x01] * 32), bdg)
+    bim = (kv(b'\x00', bytes.fromhex(emg_hex)) +
+           kv(b'\x01', ct_out(bytes.fromhex(ctx['spk_e']), coin_val)) +
+           kv(b'\x02' + k1, bsig) + kv(b'\x05', S_E) +
+           origins + b'\x00')
+    open(os.path.join(outdir, 'exit_baddest.k1.psbt'), 'wb').write(
+        b'psbt\xff' + kv(b'\x00', btx) + b'\x00' + bim + b'\x00')
+    rc, sim_out = run_cosign_sim(
+        outdir, 'exit_baddest.k1.psbt')
+    ok('%s(E): device REFUSES an exit paying a wrong destination' % tag,
+       rc != 0 and 'COSIGN FAIL' in sim_out and
+       'must re-enroll to fresh' in sim_out, sim_out[-400:])
+
+    # (2) exit ceremony WITHOUT the K1 co-signature: P3 requires the
+    #     user key on every sink spend - device-only is not enough
+    nim = (kv(b'\x00', bytes.fromhex(emg_hex)) +
+           kv(b'\x01', ct_out(bytes.fromhex(ctx['spk_e']), coin_val)) +
+           kv(b'\x05', S_E) + origins + b'\x00')
+    open(os.path.join(outdir, 'exit_nok1.psbt'), 'wb').write(
+        b'psbt\xff' + kv(b'\x00', xtx) + b'\x00' + nim + b'\x00')
+    rc, sim_out = run_cosign_sim(outdir, 'exit_nok1.psbt')
+    ok('%s(E): device REFUSES an exit without the K1 co-signature' %
+       tag, rc != 0 and 'COSIGN FAIL' in sim_out and
+       'K1 co-signature required' in sim_out, sim_out[-400:])
+
+
 # ---- flow D: GUI logic parity on real funding -----------------------------
 
 def flow_gui_parity(cli, ctx, ref_outdir, funding_path):
@@ -802,6 +988,7 @@ def main():
             flow_already_correct(tag, path, cli, ctx, miner,
                                  do_cosign=(tag.startswith('firmware')))
         flow_multi_ladder(APPS[0][0], APPS[0][1], cli, ctx, miner)
+        flow_exit_ceremony(APPS[0][0], APPS[0][1], cli, ctx, miner)
         flow_gui_parity(cli, ctx,
                         os.path.join(OUTROOT, 'vault_tree_standalone_ac'),
                         os.path.join(OUTROOT, 'vault_tree_standalone_ac',

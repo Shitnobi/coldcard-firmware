@@ -7,5 +7,6 @@
  "leaves": 5,
  "emg_fee": 500,
  "emg_step": 13,
- "deposit_fee": 500
+ "deposit_fee": 500,
+ "exit_spk": ""
 }
