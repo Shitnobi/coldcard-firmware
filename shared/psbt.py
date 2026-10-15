@@ -603,7 +603,7 @@ class psbtInputProxy(psbtProxy):
         'fully_signed', 'is_segwit', 'is_multisig', 'is_p2sh', 'num_our_keys',
         'required_key', 'scriptSig', 'amount', 'scriptCode', 'previous_txid',
         'prevout_idx', 'sequence', 'req_time', 'req_height', 'addr_fmt',
-        'wif_redeem_script',
+        'wif_redeem_script', 'is_vault', 'vault_script',
     )
 
     def __init__(self, fd, idx):
@@ -786,6 +786,64 @@ class psbtInputProxy(psbtProxy):
         return (is_wrapped_p2wpkh_redeem(redeem_script) or is_wrapped_p2wsh_redeem(redeem_script)) \
             and hash160(redeem_script) == addr_or_pubkey
 
+    def _classify_vault_input(self, my_idx, spk_hash):
+        # V-01/V-02 fix: recognize an enrolled vault script (S_v ladder /
+        # S_e emergency) on this P2WSH input by structure, and compute
+        # completeness by ROLE, not by raw signature counts.
+        #
+        # The M/N heuristics elsewhere in this file read policy opcodes as
+        # M/N counts: S_v's leading OP_IF parses as M=19 (fatal 'Unknown
+        # multisig wallet' -> vault locked out of its own coins), and S_e's
+        # first data push parses as M=-47 (len(part_sigs) >= -47 is always
+        # true -> 'Transaction looks completely signed already?').
+        #
+        # Sets is_vault ('sv'|'se') + vault_script and role-based
+        # fully_signed; leaves everything untouched for non-vault scripts.
+        import vault_signing
+
+        # master-scoped read: during a CCC tmp-seed session the plain get
+        # would see the (empty) tmp scope and miss the enrollment
+        try:
+            v = settings.master_get('vault')
+        except Exception:
+            v = None
+        cfg = v if isinstance(v, dict) else {}
+        if not (cfg.get('sv_hash') or cfg.get('spk_e')):
+            return
+
+        try:
+            script = self.get(self.witness_script)
+            kind = vault_signing.recognize(script, cfg)
+        except vault_signing.VaultViolation as e:
+            # claims to be a vault coin but isn't the enrolled shape
+            raise FatalPSBTIssue('vault input #%d: %s' % (my_idx, e))
+        except Exception:
+            raise FatalPSBTIssue('vault input: unparseable witness script')
+
+        if not kind:
+            return
+
+        if not cfg.get('enabled'):
+            # a vault coin is present but vault mode is off: fail closed.
+            # Re-enabling vault mode restores spendability (config change,
+            # never fund loss), but silently co-signing vault coins with
+            # the policy gate disabled would be a class-2 bug.
+            raise FatalPSBTIssue('vault coin on input #%d, but vault mode '
+                                 'is disabled' % my_idx)
+
+        # signing-side V-05: the witness script must hash to the spk we
+        # were shown (recognize already matched the enrolled cfg hash;
+        # this pins all three together: cfg == script == spent coin)
+        if ngu.hash.sha256s(script) != spk_hash:
+            raise FatalPSBTIssue('vault input #%d: witness script hash '
+                                 'mismatch' % my_idx)
+
+        self.is_vault = kind
+        self.vault_script = script
+        self.is_multisig = True       # reuse the set-of-keys signing path
+        self.fully_signed = vault_signing.vault_complete(
+            kind, script, set(self.part_sigs or {}))
+
     def determine_my_signing_key(self, my_idx, utxo, my_xfp, psbt, cosign_xfp=None):
         # See what it takes to sign this particular input
         # - type of script
@@ -811,6 +869,24 @@ class psbtInputProxy(psbtProxy):
                     self.wif_redeem_script = b'\x00\x14' + psbt.wif_store._pkh[idx]
                     if self.redeem_script:
                         assert self.get(self.redeem_script) == self.wif_redeem_script
+
+        # V-01/V-02 fix: classify vault scripts BEFORE the early return
+        # and any M/N heuristics - count-based fully_signed guesses and
+        # disassemble_multisig_mn misread vault policy opcodes as M/N
+        # counts (OP_IF -> M=19; first push of S_e -> M=-47)
+        if self.addr_fmt == AF_P2WSH and self.witness_script:
+            self._classify_vault_input(my_idx, addr_or_pubkey)
+            if self.is_vault and self.fully_signed:
+                # role-based threshold already met by the provided
+                # signatures; nothing for us to add to this input.
+                # Must still mark it segwit + set scriptCode (as the
+                # normal path below would) so finalize() builds a
+                # witness rather than treating it as a legacy input
+                # and routing it into multisig_signatures.
+                self.is_segwit = True
+                self.scriptCode = ser_string(self.vault_script)
+                self.required_key = None
+                return
 
         if not subpaths or self.fully_signed or (not self.num_our_keys):
             # without xfp+path we will not be able to sign this input
@@ -884,6 +960,13 @@ class psbtInputProxy(psbtProxy):
                     elif pubkey in psbt.wif_store:
                         which_key.add(pubkey)
 
+                if self.is_vault:
+                    # only keys that actually appear in the enrolled
+                    # script can produce a useful signature
+                    import vault_signing
+                    which_key &= set(vault_signing.script_keys(
+                        self.is_vault, self.vault_script))
+
             if self.witness_script and not self.is_segwit and self.is_multisig:
                 # bugfix
                 self.addr_fmt = AF_P2WSH_P2SH
@@ -923,37 +1006,46 @@ class psbtInputProxy(psbtProxy):
             # - check it's the right M/N to match redeem script
             # - which_key can be empty set, meaning all is already signed
 
-            #print("redeem: %s" % b2a_hex(redeem_script))
-            M, N = disassemble_multisig_mn(redeem_script)
-
-            if len(self.part_sigs) >= M:
-                self.fully_signed = True
-                return
-
-            xfp_paths = list(subpaths.values())
-            xfp_paths.sort()
-
-            # only search wallets with correct script type (aka address format)
-            if not psbt.active_multisig:
-                # search for multisig wallet
-                wal = MultisigWallet.find_match(M, N, xfp_paths, [self.addr_fmt])
-                if not wal:
-                    raise FatalPSBTIssue('Unknown multisig wallet')
-
-                psbt.active_multisig = wal
+            if self.is_vault:
+                # V-01 fix: vault scripts were already structurally
+                # validated against the enrollment (recognize: cfg hash
+                # match + full parse) and spk-cross-checked at
+                # classification time. The M/N heuristics and wallet
+                # matching below cannot parse policy opcodes (OP_IF,
+                # OP_CSV, OP_CHECKSIGVERIFY) as multisig structure.
+                pass
             else:
-                # check consistent w/ already selected wallet
-                psbt.active_multisig.assert_matching(M, N, xfp_paths, self.addr_fmt)
+                #print("redeem: %s" % b2a_hex(redeem_script))
+                M, N = disassemble_multisig_mn(redeem_script)
 
-            # validate redeem script, by disassembling it and checking all pubkeys
-            try:
-                psbt.active_multisig.validate_script(redeem_script, subpaths=subpaths)
-                target_spk, _ = chains.current_chain().script_pubkey(self.addr_fmt,
-                                                                     script=redeem_script)
-                assert target_spk == utxo.scriptPubKey, "spk mismatch"
-            except BaseException as exc:
-                # sys.print_exception(exc)
-                raise FatalPSBTIssue('Input #%d: %s' % (my_idx, exc))
+                if len(self.part_sigs) >= M:
+                    self.fully_signed = True
+                    return
+
+                xfp_paths = list(subpaths.values())
+                xfp_paths.sort()
+
+                # only search wallets with correct script type (aka address format)
+                if not psbt.active_multisig:
+                    # search for multisig wallet
+                    wal = MultisigWallet.find_match(M, N, xfp_paths, [self.addr_fmt])
+                    if not wal:
+                        raise FatalPSBTIssue('Unknown multisig wallet')
+
+                    psbt.active_multisig = wal
+                else:
+                    # check consistent w/ already selected wallet
+                    psbt.active_multisig.assert_matching(M, N, xfp_paths, self.addr_fmt)
+
+                # validate redeem script, by disassembling it and checking all pubkeys
+                try:
+                    psbt.active_multisig.validate_script(redeem_script, subpaths=subpaths)
+                    target_spk, _ = chains.current_chain().script_pubkey(self.addr_fmt,
+                                                                         script=redeem_script)
+                    assert target_spk == utxo.scriptPubKey, "spk mismatch"
+                except BaseException as exc:
+                    # sys.print_exception(exc)
+                    raise FatalPSBTIssue('Input #%d: %s' % (my_idx, exc))
 
         if not which_key and DEBUG:
             print("no key: input #%d: type=%s segwit=%d a_or_pk=%s scriptPubKey=%s" % (
@@ -2532,9 +2624,36 @@ class psbtObject(psbtProxy):
 
     def multi_input_complete(self, inp):
         # raises if input is not multisig or no active_multisig loaded
-        assert inp.is_multisig
+        if not inp.is_multisig:
+            raise FatalPSBTIssue('internal: not a multisig input')
+        if inp.is_vault:
+            # V-01/V-02 fix: role-based, not count-based
+            return self._vault_input_complete(inp)
+        if self.active_multisig is None:
+            raise FatalPSBTIssue('internal: no active multisig wallet')
         if (len(inp.added_sigs) + len(inp.part_sigs)) >= self.active_multisig.M:
             return True
+
+    def vault_sigs_by_pk(self, inp):
+        # Merge our signatures with the PSBT's partial signatures, keyed
+        # by pubkey (real psbtObject part_sigs values are (pos,len) file
+        # proxies; resolve them here).
+        sigs = dict(inp.added_sigs or {})
+        for pk, ref in (inp.part_sigs or {}).items():
+            try:
+                sigs[pk] = self.get(ref) if isinstance(ref, (tuple, list)) else ref
+            except Exception:
+                pass
+        return sigs
+
+    def _vault_input_complete(self, inp):
+        # role-based threshold over the merged signature set
+        import vault_signing
+        try:
+            return vault_signing.vault_complete(
+                inp.is_vault, inp.vault_script, set(self.vault_sigs_by_pk(inp)))
+        except vault_signing.VaultViolation as e:
+            raise FatalPSBTIssue('vault input: %s' % e)
 
     def is_complete(self):
         # Are all the inputs (now) signed?
@@ -2543,8 +2662,20 @@ class psbtObject(psbtProxy):
         signed = len(self.presigned_inputs)
 
         # plus we added some signatures
-        for inp in self.inputs:
-            if inp.is_multisig and self.active_multisig:
+        for i, inp in enumerate(self.inputs):
+            if i in self.presigned_inputs:
+                # already counted above (fully_signed at parse time,
+                # including vault inputs whose role threshold was met)
+                continue
+
+            if inp.is_vault:
+                # V-01/V-02 fix: role-based, not count-based; do not
+                # fall into the added_sigs shortcut below (adding a
+                # signature is not the same as completing a threshold)
+                if self._vault_input_complete(inp):
+                    signed += 1
+
+            elif inp.is_multisig and self.active_multisig:
                 if self.multi_input_complete(inp):
                     signed += 1
 
@@ -2554,7 +2685,8 @@ class psbtObject(psbtProxy):
         return signed == self.num_inputs
 
     def multisig_signatures(self, inp):
-        assert self.active_multisig
+        if self.active_multisig is None:
+            raise FatalPSBTIssue('internal: no active multisig wallet')
         # collect all signatures into one place
         # both we added & those already in part_sigs
         all_sigs = {}
@@ -2632,18 +2764,27 @@ class psbtObject(psbtProxy):
 
         body_start = fd.tell()
 
+        # nSequence per vault input: the S_v branch selector in the final
+        # witness must match the sequence the policy gate approved
+        # (ladder/CSV vs emergency/ELSE)
+        vault_seq = {}
+
         # inputs
         fd.write(ser_compact_size(self.num_inputs))
         for in_idx, txi in self.input_iter():
             inp = self.inputs[in_idx]
+            if inp.is_vault:
+                vault_seq[in_idx] = txi.nSequence
 
             # first check - if no signature(s) - fail soon
             if inp.is_multisig:
-                assert self.multi_input_complete(inp), 'Incomplete signature set on input #%d' % in_idx
+                if not self.multi_input_complete(inp):
+                    raise FatalPSBTIssue('Incomplete signature set on input #%d' % in_idx)
             else:
                 # single signature
                 ssig = self.singlesig_signature(inp)
-                assert ssig, 'No signature on input #%d' % in_idx
+                if not ssig:
+                    raise FatalPSBTIssue('No signature on input #%d' % in_idx)
 
             if inp.is_segwit:
                 if inp.is_multisig:
@@ -2707,8 +2848,24 @@ class psbtObject(psbtProxy):
 
                 if inp.is_segwit:
                     # put in new sig: wit is a CTxInWitness
-                    assert not wit.scriptWitness.stack, 'replacing non-empty?'
-                    if inp.is_multisig:
+                    if wit.scriptWitness.stack:
+                        raise FatalPSBTIssue('replacing non-empty witness?')
+                    if inp.is_vault:
+                        # V-01 fix: the vault witness is branch- and
+                        # role-sensitive; a generic CHECKMULTISIG stack
+                        # ([dummy]+sigs+[script]) does not satisfy S_v
+                        # (OP_IF selector) or S_e (K1 CHECKSIGVERIFY then
+                        # 2-of-2 over K2/K3). Signatures are ordered by
+                        # their key's position in the script.
+                        import vault_signing
+                        try:
+                            wit.scriptWitness.stack = vault_signing.build_witness(
+                                inp.is_vault, inp.vault_script,
+                                self.vault_sigs_by_pk(inp),
+                                vault_seq.get(in_idx))
+                        except vault_signing.VaultViolation as e:
+                            raise FatalPSBTIssue('vault witness: %s' % e)
+                    elif inp.is_multisig:
                         sigs = self.multisig_signatures(inp)
                         wit.scriptWitness.stack = [b""] + sigs + [self.get(inp.witness_script)]
                     else:

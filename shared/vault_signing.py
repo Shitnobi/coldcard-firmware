@@ -278,23 +278,30 @@ def vault_missing_roles(kind, wscript, signed_pks):
 
 def build_witness(kind, wscript, sigs_by_pk, sequence):
     # Construct the final witness stack for a vault input.
-    #   S_v: [selector, dummy, sig_a, sig_b, script]
-    #        selector: empty (FALSE -> OP_ELSE, emergency/no-CSV) or
-    #                  0x01 (TRUE -> OP_IF, CSV ladder branch)
-    #        selector is derived from nSequence - exactly the fact the
-    #        policy gate verified (P1 <=> 0xFFFFFFFD, ladder <=> N) - so
-    #        the device constructs the branch it approved.
-    #   S_e: [sig_K1, dummy, sig_other, script]
-    # Signatures are ordered by their key's position in the script
-    # (OP_CHECKMULTISIG requires sigs in pubkey order).
+    #
+    # Stack order requirements (verified empirically against a minimal
+    # Bitcoin script interpreter with real signatures - see
+    # testing/witness_order_check.py - and matching Bitcoin Core's
+    # EvalScript pop order):
+    #   S_v: [dummy, sig_a, sig_b, selector, script]
+    #        - OP_IF pops the branch selector from the TOP of the stack, so
+    #          the selector must be the LAST item before the witness script.
+    #          empty = FALSE -> OP_ELSE (emergency, nSequence 0xFFFFFFFD);
+    #          0x01 = TRUE -> OP_IF (CSV ladder, nSequence == N).
+    #        - OP_CHECKMULTISIG matches the topmost signature against the
+    #          topmost (last-in-script) pubkey first, so signatures must be
+    #          laid bottom-to-top in script pubkey order.
+    #   S_e: [dummy, sig_other, sig_K1, script]
+    #        - OP_CHECKSIGVERIFY pops K1's pubkey, then the signature
+    #          directly beneath it, so K1's signature must be the TOPMOST
+    #          signature. The OP_1/OP_2 CHECKMULTISIG consumes one dummy
+    #          before the remaining sig.
+    # The selector is derived from nSequence - exactly the fact the policy
+    # gate verified - so the device constructs the branch it approved.
     keys = script_keys(kind, wscript)
-    stack = []
-    if kind == 'sv':
-        cls, _n = sequence_class(sequence)
-        stack.append(b'\x01' if cls in ('csv', 'csv_time') else b'')
-    stack.append(b'')                      # CHECKMULTISIG dummy
+    stack = [b'']                           # CHECKMULTISIG dummy
     if kind == 'se':
-        order = [0] + [i for i in (1, 2) if keys[i] in sigs_by_pk][:1]
+        order = [i for i in (1, 2) if keys[i] in sigs_by_pk][:1] + [0]
     else:
         order = [i for i in range(3) if keys[i] in sigs_by_pk][:2]
     for i in order:
@@ -302,6 +309,9 @@ def build_witness(kind, wscript, sigs_by_pk, sequence):
         if sig is None:
             raise VaultViolation('witness: missing sig for key #%d' % i)
         stack.append(bytes(sig))
+    if kind == 'sv':
+        cls, _n = sequence_class(sequence)
+        stack.append(b'\x01' if cls in ('csv', 'csv_time') else b'')
     stack.append(bytes(wscript))
     return stack
 
