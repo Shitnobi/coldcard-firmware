@@ -124,7 +124,8 @@ if not have_request:
     # ---- dump mode: publish the device's vault commitments -----------------
     ctx = {'k2_pubkey': b2h(K2), 'k1_pubkey': b2h(K1), 'k3_pubkey': b2h(K3),
            'spk_v': b2h(SPK_V), 'spk_e': b2h(SPK_E),
-           's_v': b2h(S_V), 's_e': b2h(S_E), 'n': N, 'f0_max': F0_MAX}
+           's_v': b2h(S_V), 's_e': b2h(S_E), 'n': N, 'f0_max': F0_MAX,
+           'xfp': MY_XFP}
     with open('core_oracle_ctx.json', 'w') as f:
         f.write(json.dumps(ctx))
     print('CORE ORACLE CTX: k2=%s... spk_v=%s...' % (ctx['k2_pubkey'][:16],

@@ -682,3 +682,43 @@ checks, up from 113). Battery on this tree: hostapp 135/135, policy
 11/11, glue 89/89, hardening 43/43, sim e2e 25/25; device sim e2e
 19/19 against a tree built by the FIXED standalone host app (lattice
 root unchanged: 1c8b7fc2...).
+
+## (o) Full-stack deposit e2e on regtest: both host apps x the device
+
+Session 2026-10-15 (cont). "Run both the firmware and the hostapp
+through an end-to-end test against regtest to ensure that a deposit
+functions correctly." New `unix/vault_hostapp_regtest.py` (host
+driver) + `unix/vault_hostapp_cosign.py` (sim-side co-signer),
+52/52 checks on the first full run, covering BOTH host apps (the
+standalone repo copy AND the firmware-repo mirror) in one pass:
+
+- real regtest coin -> funding PSBT (input-only shape) -> hostapp
+  CLI builds the tree;
+- the regtest wallet signs the hostapp's `deposit.psbt` via
+  `walletprocesspsbt`/`finalizepsbt` (the PSBT a REAL wallet
+  consumes - not host-side re-signing);
+- broadcast + mined: on-chain txid == the manifest's PREDICTED
+  `deposit_txid`; `gettxout` confirms the vault coin pays S_v with
+  the predicted value;
+- the device enrolls cfg + lattice from the manifest and passes all
+  gate checks (`vault_sim_e2e.py`, 19/19 per tree);
+- the device co-signs the HOSTAPP-BUILT `emg0` leaf (the leaf file
+  itself, augmented host-side with the user's K1 partial signature
+  and BIP-32 key origins, signed host-side with python-ecdsa,
+  low-S), through the full real firmware chain (read_psbt ->
+  validate -> consider_* -> VaultMode.could_sign -> sign_it ->
+  finalize), after enrolling from the manifest;
+- host-side BIP-143 verification of the co-signed spend, then
+  testmempoolaccept + sendrawtransaction + mined: vault coin SPENT
+  on-chain, emergency output confirmed paying spk_e.
+
+Supporting change: `vault_core_sign.py` dump ctx now also publishes
+the device xfp (additive; needed for the K2 key origin the
+K1-augmented leaf carries). Oracle re-run after the change:
+selfcheck + regtest (emergency + ladder, incl. BIP-68 pre-maturity
+refusal) all PASS.
+
+The two host app copies produced byte-equivalent trees for equal
+policies (device derived the same K2, both enrollments hit the same
+lattice-root machinery), confirming the sync invariant on-chain.
+No bitcoind/sim processes left behind; temp datadir cleaned.
