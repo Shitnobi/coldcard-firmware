@@ -318,7 +318,15 @@ def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
         tx = ser_tx(version, [(dep_txid, vault_vout, SEQ_EMERGENCY)],
                     [(spk_e, vault_value - fee)], 0)
         wu = ct_out(spk_v, vault_value)
-        im = vi(1) + b'\x01' + vi(len(wu)) + wu + b'\x00'   # witness-utxo map
+        # Hardened leaf input map (mirrors unix/vault_e2e_gen.py): the
+        # device's V-05 view_from_psbt refuses witness-utxo-only inputs
+        # (no txid binding for fee-bearing classes) and the V-03 partial
+        # -sig verifier needs the witness script - so carry the FULL
+        # deposit tx as the non-witness UTXO plus both witness fields.
+        im = vi(1) + b'\x00' + vi(len(dep_tx)) + dep_tx  # NON_WITNESS_UTXO
+        im += vi(1) + b'\x01' + vi(len(wu)) + wu        # WITNESS_UTXO
+        im += vi(1) + b'\x05' + vi(len(s_v)) + s_v      # WITNESS_SCRIPT
+        im += b'\x00'
         name = 'emg%0*d.psbt' % (leaf_w, i)
         open(os.path.join(outdir, name), 'wb').write(
             build_psbt(tx, [im], 1))
